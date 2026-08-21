@@ -5,6 +5,8 @@
  */
 package org.kde.kdeconnect.plugins.jarvis
 
+import android.content.Context
+import android.content.SharedPreferences
 import android.os.Handler
 import android.os.Looper
 import android.content.Intent
@@ -19,6 +21,7 @@ import org.kde.kdeconnect.NetworkPacket
 import org.kde.kdeconnect.plugins.Plugin
 import org.kde.kdeconnect.plugins.PluginFactory.LoadablePlugin
 import org.kde.kdeconnect_tp.R
+import java.util.regex.Pattern
 
 @LoadablePlugin
 class JarvisPlugin : Plugin() {
@@ -32,11 +35,16 @@ class JarvisPlugin : Plugin() {
     val askConsole = mutableStateListOf<JarvisOutputLine>()
     val configTexts = mutableStateMapOf<String, String>()
     val configPaths = mutableStateMapOf<String, String>()
-    val busy = mutableStateOf(false)
+    val runBusy = mutableStateOf(false)
+    val askBusy = mutableStateOf(false)
+    val muted = mutableStateOf(false)
     val sequence = mutableStateListOf<JarvisSequenceItem>()
     private val jobId = mutableIntStateOf(1)
     private var assistantBuffer = StringBuilder()
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val prefs: SharedPreferences by lazy {
+        context.getSharedPreferences("jarvis_prefs", Context.MODE_PRIVATE)
+    }
 
     private fun onMain(block: () -> Unit) {
         if (Looper.myLooper() == Looper.getMainLooper()) {
@@ -66,6 +74,8 @@ class JarvisPlugin : Plugin() {
     )
 
     override fun onCreate(): Boolean {
+        muted.value = prefs.getBoolean("muted", false)
+        JarvisSpeech.ensure(context)
         requestStatus()
         return true
     }
@@ -123,7 +133,8 @@ class JarvisPlugin : Plugin() {
                 val message = np.getString("message")
                 onMain {
                     lastError.value = message
-                    busy.value = false
+                    askBusy.value = false
+                    runBusy.value = false
                     dropThinkingPlaceholder()
                 }
                 return true
@@ -131,7 +142,7 @@ class JarvisPlugin : Plugin() {
             "runStart" -> {
                 val cmdline = np.getString("cmdline")
                 onMain {
-                    busy.value = true
+                    runBusy.value = true
                     runOutput.add(JarvisOutputLine("command", cmdline))
                 }
                 return true
@@ -149,14 +160,14 @@ class JarvisPlugin : Plugin() {
             "runExit" -> {
                 val code = np.getInt("code", -1)
                 onMain {
-                    busy.value = false
+                    runBusy.value = false
                     runOutput.add(JarvisOutputLine("exit", "exit $code"))
                 }
                 return true
             }
             "askStart" -> {
                 onMain {
-                    busy.value = true
+                    askBusy.value = true
                     assistantBuffer = StringBuilder()
                     ensureThinkingPlaceholder()
                 }
@@ -178,7 +189,7 @@ class JarvisPlugin : Plugin() {
             "askExit" -> {
                 val code = np.getInt("code", -1)
                 onMain {
-                    busy.value = false
+                    askBusy.value = false
                     finishLiveAssistant()
                     askConsole.add(JarvisOutputLine("exit", "exit $code"))
                 }
@@ -243,10 +254,49 @@ class JarvisPlugin : Plugin() {
         val text = assistantBuffer.toString().trimEnd()
         if (text.isNotEmpty()) {
             askMessages[idx] = JarvisChatMessage(false, text, live = false, thinking = false)
+            maybeSpeak(text)
         } else if (askMessages[idx].thinking) {
             askMessages.removeAt(idx)
         } else {
             askMessages[idx] = askMessages[idx].copy(live = false, thinking = false)
+        }
+    }
+
+    private fun maybeSpeak(text: String) {
+        if (muted.value) {
+            return
+        }
+        JarvisSpeech.ensure(context)
+        JarvisSpeech.speak(text)
+    }
+
+    fun setMuted(value: Boolean) {
+        muted.value = value
+        prefs.edit().putBoolean("muted", value).apply()
+        if (value) {
+            JarvisSpeech.stop()
+        }
+    }
+
+    fun toggleMute() {
+        setMuted(!muted.value)
+    }
+
+    private val mutePattern = Pattern.compile(
+        "\\b(mute(?:\\s+yourself)?|be quiet|silence(?:\\s+yourself)?|stop (?:talking|speaking)|hush|voice off)\\b",
+        Pattern.CASE_INSENSITIVE,
+    )
+    private val unmutePattern = Pattern.compile(
+        "\\b(unmute|speak again|you (?:may|can) talk|voice on|unmute yourself)\\b",
+        Pattern.CASE_INSENSITIVE,
+    )
+
+    private fun applyVoiceCommand(text: String) {
+        if (mutePattern.matcher(text).find()) {
+            setMuted(true)
+        } else if (unmutePattern.matcher(text).find()) {
+            setMuted(false)
+            maybeSpeak("Online, sir.")
         }
     }
 
@@ -326,9 +376,10 @@ class JarvisPlugin : Plugin() {
     }
 
     fun ask(text: String) {
+        applyVoiceCommand(text)
         askMessages.add(JarvisChatMessage(true, text))
         ensureThinkingPlaceholder()
-        busy.value = true
+        askBusy.value = true
         val id = jobId.intValue++
         sendAction("ask") {
             it["id"] = id
@@ -336,8 +387,12 @@ class JarvisPlugin : Plugin() {
         }
     }
 
-    fun cancel() {
-        sendAction("cancel")
+    fun cancel(kind: String = "") {
+        sendAction("cancel") {
+            if (kind.isNotEmpty()) {
+                it["kind"] = kind
+            }
+        }
     }
 
     fun aiClear() {

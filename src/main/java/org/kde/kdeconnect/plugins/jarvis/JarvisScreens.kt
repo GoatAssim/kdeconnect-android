@@ -13,6 +13,12 @@ import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.util.Base64
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.text.AnnotatedString
 import android.widget.Toast
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -575,8 +581,10 @@ private fun OutputScreen(plugin: JarvisPlugin, back: () -> Unit, commandOutput: 
                 ),
                 navIconOnClick = back,
                 actions = {
-                    if (plugin.busy.value) {
-                        TextButton(onClick = { plugin.cancel() }) {
+                    if ((commandOutput && plugin.runBusy.value) || (!commandOutput && plugin.askBusy.value)) {
+                        TextButton(onClick = {
+                            plugin.cancel(if (commandOutput) "run" else "ask")
+                        }) {
                             Text(stringResource(R.string.jarvis_abort))
                         }
                     }
@@ -607,13 +615,21 @@ private fun OutputScreen(plugin: JarvisPlugin, back: () -> Unit, commandOutput: 
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun AskScreen(plugin: JarvisPlugin, back: () -> Unit) {
     var input by remember { mutableStateOf("") }
     var showConsole by remember { mutableStateOf(false) }
     var viewer by remember { mutableStateOf<JarvisChatMessage?>(null) }
+    var menuFor by remember { mutableStateOf<JarvisChatMessage?>(null) }
     val messages = plugin.askMessages
     val listState = rememberLazyListState()
+    val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+    val haptics = LocalHapticFeedback.current
+    LaunchedEffect(Unit) {
+        JarvisSpeech.ensure(context)
+    }
     LaunchedEffect(messages.size, messages.lastOrNull()?.text, messages.lastOrNull()?.thinking) {
         if (messages.isNotEmpty()) {
             listState.animateScrollToItem(messages.lastIndex)
@@ -640,6 +656,13 @@ private fun AskScreen(plugin: JarvisPlugin, back: () -> Unit) {
                 title = stringResource(R.string.jarvis_ask_button),
                 navIconOnClick = back,
                 actions = {
+                    TextButton(onClick = { plugin.toggleMute() }) {
+                        Text(
+                            stringResource(
+                                if (plugin.muted.value) R.string.jarvis_unmute else R.string.jarvis_mute,
+                            ),
+                        )
+                    }
                     TextButton(onClick = { showConsole = true }) {
                         Text(stringResource(R.string.jarvis_console))
                     }
@@ -667,49 +690,78 @@ private fun AskScreen(plugin: JarvisPlugin, back: () -> Unit) {
                         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
                         horizontalArrangement = if (msg.fromUser) Arrangement.End else Arrangement.Start,
                     ) {
-                        Card(
-                            modifier = Modifier.widthIn(max = 320.dp),
-                            shape = RoundedCornerShape(16.dp),
-                            colors = androidx.compose.material3.CardDefaults.cardColors(containerColor = bubbleColor),
-                        ) {
-                            Column(Modifier.padding(12.dp)) {
-                                Text(
-                                    if (msg.fromUser) stringResource(R.string.jarvis_you) else stringResource(R.string.jarvis_ask_button),
-                                    style = MaterialTheme.typography.labelMedium,
-                                    color = textColor,
-                                )
-                                val image = msg.imageBase64
-                                if (!image.isNullOrEmpty()) {
-                                    val imageBitmap = remember(image) {
-                                        try {
-                                            val bytes = Base64.decode(image, Base64.DEFAULT)
-                                            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
-                                        } catch (_: Exception) {
-                                            null
-                                        }
-                                    }
-                                    if (imageBitmap != null) {
-                                        Image(
-                                            bitmap = imageBitmap,
-                                            contentDescription = stringResource(R.string.jarvis_screenshot),
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .heightIn(max = 280.dp)
-                                                .padding(top = 8.dp)
-                                                .clickable { viewer = msg },
-                                            contentScale = ContentScale.Fit,
-                                        )
-                                    }
-                                    Text(msg.text, color = textColor, style = MaterialTheme.typography.bodySmall)
-                                } else if (msg.thinking) {
+                        Box {
+                            Card(
+                                modifier = Modifier
+                                    .widthIn(max = 320.dp)
+                                    .combinedClickable(
+                                        onClick = {},
+                                        onLongClick = {
+                                            haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                            menuFor = msg
+                                        },
+                                    ),
+                                shape = RoundedCornerShape(16.dp),
+                                colors = androidx.compose.material3.CardDefaults.cardColors(containerColor = bubbleColor),
+                            ) {
+                                Column(Modifier.padding(12.dp)) {
                                     Text(
-                                        stringResource(R.string.jarvis_thinking),
-                                        color = textColor.copy(alpha = 0.8f),
-                                        fontStyle = FontStyle.Italic,
+                                        if (msg.fromUser) stringResource(R.string.jarvis_you) else stringResource(R.string.jarvis_ask_button),
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = textColor,
                                     )
-                                } else {
-                                    Text(msg.text, color = textColor)
+                                    val image = msg.imageBase64
+                                    if (!image.isNullOrEmpty()) {
+                                        val imageBitmap = remember(image) {
+                                            try {
+                                                val bytes = Base64.decode(image, Base64.DEFAULT)
+                                                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+                                            } catch (_: Exception) {
+                                                null
+                                            }
+                                        }
+                                        if (imageBitmap != null) {
+                                            Image(
+                                                bitmap = imageBitmap,
+                                                contentDescription = stringResource(R.string.jarvis_screenshot),
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .heightIn(max = 280.dp)
+                                                    .padding(top = 8.dp)
+                                                    .clickable { viewer = msg },
+                                                contentScale = ContentScale.Fit,
+                                            )
+                                        }
+                                        Text(msg.text, color = textColor, style = MaterialTheme.typography.bodySmall)
+                                    } else if (msg.thinking) {
+                                        Text(
+                                            stringResource(R.string.jarvis_thinking),
+                                            color = textColor.copy(alpha = 0.8f),
+                                            fontStyle = FontStyle.Italic,
+                                        )
+                                    } else if (msg.fromUser) {
+                                        Text(msg.text, color = textColor)
+                                    } else {
+                                        JarvisMarkdownText(msg.text, textColor)
+                                    }
                                 }
+                            }
+                            DropdownMenu(
+                                expanded = menuFor === msg,
+                                onDismissRequest = { menuFor = null },
+                            ) {
+                                DropdownMenuItem(
+                                    text = { Text(stringResource(R.string.jarvis_copy)) },
+                                    onClick = {
+                                        clipboard.setText(AnnotatedString(msg.text))
+                                        Toast.makeText(
+                                            context,
+                                            context.getString(R.string.jarvis_copied),
+                                            Toast.LENGTH_SHORT,
+                                        ).show()
+                                        menuFor = null
+                                    },
+                                )
                             }
                         }
                     }
@@ -724,10 +776,10 @@ private fun AskScreen(plugin: JarvisPlugin, back: () -> Unit) {
                     onValueChange = { input = it },
                     modifier = Modifier.weight(1f),
                     placeholder = { Text(stringResource(R.string.jarvis_ask_hint)) },
-                    enabled = !plugin.busy.value,
+                    enabled = !plugin.askBusy.value,
                 )
-                if (plugin.busy.value) {
-                    IconButton(onClick = { plugin.cancel() }) {
+                if (plugin.askBusy.value) {
+                    IconButton(onClick = { plugin.cancel("ask") }) {
                         Text(stringResource(R.string.jarvis_abort))
                     }
                 } else {
