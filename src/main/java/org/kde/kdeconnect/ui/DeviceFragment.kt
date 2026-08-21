@@ -34,6 +34,8 @@ import org.kde.kdeconnect.extensions.setupBottomPadding
 import org.kde.kdeconnect.helpers.security.SslHelper
 import org.kde.kdeconnect.plugins.Plugin
 import org.kde.kdeconnect.plugins.battery.BatteryPlugin
+import org.kde.kdeconnect.plugins.jarvis.JarvisPlugin
+import org.kde.kdeconnect.plugins.mousepad.MousePadPlugin
 import org.kde.kdeconnect.ui.compose.KdeTheme
 import androidx.compose.runtime.getValue
 import androidx.fragment.app.viewModels
@@ -61,6 +63,15 @@ class DeviceFragment : BaseFragment<ActivityDeviceBinding>() {
             args.putBoolean(ARG_FROM_DEVICE_LIST, fromDeviceList)
             frag.arguments = args
             return frag
+        }
+
+        private fun orderedPluginButtons(plugins: Collection<Plugin>): List<Plugin.PluginUiButton> {
+            val mousepad = plugins.filterIsInstance<MousePadPlugin>().flatMap { it.getUiButtons() }
+            val jarvis = plugins.filterIsInstance<JarvisPlugin>().flatMap { it.getUiButtons() }
+            val rest = plugins
+                .filter { it !is MousePadPlugin && it !is JarvisPlugin }
+                .flatMap { it.getUiButtons() }
+            return mousepad + jarvis + rest
         }
     }
 
@@ -233,8 +244,7 @@ class DeviceFragment : BaseFragment<ActivityDeviceBinding>() {
                     when (device.pairStatus) {
                         PairingHandler.PairState.Paired -> {
                             if (device.isReachable) {
-                                val pluginsWithButtons =
-                                    device.loadedPlugins.values.flatMap { plugin -> plugin.getUiButtons() }
+                                val pluginsWithButtons = orderedPluginButtons(device.loadedPlugins.values)
                                 val pluginsNeedPermissions =
                                     device.pluginsWithoutPermissions.values.filter { plugin ->
                                         device.isPluginEnabled(plugin.pluginKey)
