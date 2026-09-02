@@ -12,6 +12,7 @@ import android.util.Log
 import rikka.shizuku.Shizuku
 import rikka.shizuku.ShizukuBinderWrapper
 import rikka.shizuku.SystemServiceHelper
+import java.lang.reflect.Method
 
 object ShizukuHelper {
 
@@ -20,6 +21,8 @@ object ShizukuHelper {
 
     @Volatile
     private var binderReady = false
+
+    private var newProcessMethod: Method? = null
 
     private val binderReceivedListener = Shizuku.OnBinderReceivedListener {
         binderReady = true
@@ -38,7 +41,24 @@ object ShizukuHelper {
             if (Shizuku.pingBinder()) {
                 binderReady = true
             }
-            Log.i(TAG, "init done available=${isAvailable()} permission=${isPermissionGranted()} uid=${getUid()}")
+            // Cache private newProcess via reflection (public API removed/hidden)
+            try {
+                val m = Shizuku::class.java.getDeclaredMethod(
+                    "newProcess",
+                    Array<String>::class.java,
+                    Array<String>::class.java,
+                    String::class.java
+                )
+                m.isAccessible = true
+                newProcessMethod = m
+            } catch (e: Throwable) {
+                Log.e(TAG, "Could not access Shizuku.newProcess", e)
+                newProcessMethod = null
+            }
+            Log.i(
+                TAG,
+                "init done available=${isAvailable()} permission=${isPermissionGranted()} uid=${getUid()} newProcess=${newProcessMethod != null}"
+            )
         } catch (e: Throwable) {
             Log.e(TAG, "Failed to init Shizuku", e)
         }
@@ -51,6 +71,7 @@ object ShizukuHelper {
         } catch (_: Throwable) {
         }
         binderReady = false
+        newProcessMethod = null
     }
 
     fun isAvailable(): Boolean {
@@ -91,15 +112,28 @@ object ShizukuHelper {
         }
     }
 
-    /**
-     * Why shell cannot run right now (null = OK to run).
-     */
+    /** Why shell cannot run right now (null = OK to run). */
     fun notReadyReason(): String? {
         return try {
             if (!Shizuku.pingBinder()) {
                 "Shizuku binder not connected (is Shizuku app running?)"
             } else if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
                 "Shizuku permission not granted to KDE Connect (open Shizuku app → Apps → allow KDE Connect)"
+            } else if (newProcessMethod == null) {
+                // try resolve again
+                try {
+                    val m = Shizuku::class.java.getDeclaredMethod(
+                        "newProcess",
+                        Array<String>::class.java,
+                        Array<String>::class.java,
+                        String::class.java
+                    )
+                    m.isAccessible = true
+                    newProcessMethod = m
+                    null
+                } catch (e: Throwable) {
+                    "Shizuku.newProcess not accessible: ${e.message}"
+                }
             } else {
                 null
             }
@@ -110,7 +144,6 @@ object ShizukuHelper {
 
     /**
      * (exitCode, stdout, stderr) or null if Shizuku not ready.
-     * On failure, check notReadyReason() / logs.
      */
     fun runShell(vararg cmd: String): Triple<Int, String, String>? {
         val reason = notReadyReason()
@@ -118,8 +151,11 @@ object ShizukuHelper {
             Log.w(TAG, "runShell blocked: $reason | cmd=${cmd.joinToString(" ")}")
             return null
         }
+
+        val method = newProcessMethod ?: return null
+
         return try {
-            val process = Shizuku.newProcess(arrayOf(*cmd), null, null)
+            val process = method.invoke(null, cmd, null, null) as Process
             val exit = process.waitFor()
             val stdout = process.inputStream.bufferedReader().use { it.readText() }
             val stderr = process.errorStream.bufferedReader().use { it.readText() }
@@ -127,6 +163,7 @@ object ShizukuHelper {
             Triple(exit, stdout, stderr)
         } catch (e: Throwable) {
             Log.e(TAG, "runShell exception cmd=${cmd.joinToString(" ")}", e)
+            // Still return a triple so callers can show the exception text
             Triple(-1, "", e.message ?: "runShell exception")
         }
     }
