@@ -126,41 +126,67 @@ class CallBridgePlugin : Plugin() {
         unregisterTelephonyListener()
         restoreRingerIfNeeded()
     }
+private val subCallbacks = mutableListOf<Any>()
 
-    private fun registerTelephonyListener() {
-        try {
-            val tm = context.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE)
-                    != PackageManager.PERMISSION_GRANTED
-                ) {
-                    Log.w(TAG, "READ_PHONE_STATE missing; listener not registered")
-                    return
-                }
-                val cb = object : TelephonyCallback(), TelephonyCallback.CallStateListener {
-                    override fun onCallStateChanged(state: Int) {
-                        onCallStateChanged(state, lastNumber, lastSubId)
-                    }
-                }
-                tm.registerTelephonyCallback(context.mainExecutor, cb)
-                telephonyCallback = cb
-            } else {
-                @Suppress("DEPRECATION")
-                val listener = object : PhoneStateListener() {
-                    @Deprecated("Deprecated in Java")
-                    override fun onCallStateChanged(state: Int, phoneNumber: String?) {
-                        if (!phoneNumber.isNullOrBlank()) lastNumber = phoneNumber
-                        onCallStateChanged(state, lastNumber, lastSubId)
-                    }
-                }
-                @Suppress("DEPRECATION")
-                tm.listen(listener, PhoneStateListener.LISTEN_CALL_STATE)
-                legacyListener = listener
-            }
-        } catch (e: Throwable) {
-            Log.e(TAG, "registerTelephonyListener failed", e)
+private fun registerTelephonyListener() {
+    try {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            Log.w(TAG, "READ_PHONE_STATE missing")
+            return
         }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            val sm = context.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE) as SubscriptionManager
+            val list = sm.activeSubscriptionInfoList
+            if (!list.isNullOrEmpty()) {
+                for (info in list) {
+                    val tmForSub = (context.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager)
+                        .createForSubscriptionId(info.subscriptionId)
+                    attachListener(tmForSub, info.subscriptionId)
+                }
+                return
+            }
+        }
+
+        val tm = context.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
+        attachListener(tm, SubscriptionManager.INVALID_SUBSCRIPTION_ID)
+    } catch (e: Throwable) {
+        Log.e(TAG, "registerTelephonyListener failed", e)
     }
+}
+
+private fun attachListener(tm: TelephonyManager, subId: Int) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        val cb = object : TelephonyCallback(), TelephonyCallback.CallStateListener {
+            override fun onCallStateChanged(state: Int) {
+                Log.i(TAG, "TelephonyCallback state=$state subId=$subId")
+                if (subId != SubscriptionManager.INVALID_SUBSCRIPTION_ID) {
+                    lastSubId = subId
+                }
+                onCallStateChanged(state, lastNumber, lastSubId)
+            }
+        }
+        tm.registerTelephonyCallback(context.mainExecutor, cb)
+        subCallbacks.add(cb)
+        telephonyCallback = cb
+    } else {
+        @Suppress("DEPRECATION")
+        val listener = object : PhoneStateListener() {
+            @Deprecated("Deprecated in Java")
+            override fun onCallStateChanged(state: Int, phoneNumber: String?) {
+                if (!phoneNumber.isNullOrBlank()) lastNumber = phoneNumber
+                if (subId != SubscriptionManager.INVALID_SUBSCRIPTION_ID) lastSubId = subId
+                onCallStateChanged(state, lastNumber, lastSubId)
+            }
+        }
+        @Suppress("DEPRECATION")
+        tm.listen(listener, PhoneStateListener.LISTEN_CALL_STATE)
+        legacyListener = listener
+        subCallbacks.add(listener)
+    }
+}
 
     private fun unregisterTelephonyListener() {
         try {
@@ -178,25 +204,21 @@ class CallBridgePlugin : Plugin() {
         telephonyCallback = null
         legacyListener = null
     }
+private fun onCallStateChanged(state: Int, number: String?, subId: Int) {
+    if (!number.isNullOrBlank()) lastNumber = number
+    if (subId != SubscriptionManager.INVALID_SUBSCRIPTION_ID) lastSubId = subId
 
-    private fun onCallStateChanged(state: Int, number: String?, subId: Int) {
-        // Always update number if we have one
-        if (!number.isNullOrBlank()) lastNumber = number
-        if (subId != SubscriptionManager.INVALID_SUBSCRIPTION_ID) lastSubId = subId
-
-        if (state == lastState && state != TelephonyManager.CALL_STATE_RINGING) {
-            // Still allow ringing updates when number arrives later
-            return
+    // Always emit on real state change
+    if (state == lastState) {
+        // Number arrived later while still ringing → update PC
+        if (state == TelephonyManager.CALL_STATE_RINGING && !number.isNullOrBlank()) {
+            sendCallEvent(state, lastNumber, lastSubId)
         }
-        // If ringing again with new number, still emit
-        val numberChanged = state == TelephonyManager.CALL_STATE_RINGING &&
-            !number.isNullOrBlank() && number != lastNumber
-
-        if (state == lastState && !numberChanged) return
-
-        lastState = state
-        sendCallEvent(state, lastNumber, lastSubId)
+        return
     }
+    lastState = state
+    sendCallEvent(state, lastNumber, lastSubId)
+}
 
     override fun onPacketReceived(np: NetworkPacket): Boolean {
         if (np.type != PACKET_TYPE) return false
