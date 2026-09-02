@@ -14,7 +14,15 @@ import android.content.pm.PackageManager
 import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.provider.ContactsContract
+import android.telecom.PhoneAccountHandle
 import android.telecom.TelecomManager
+import android.telephony.PhoneStateListener
+import android.telephony.SubscriptionManager
+import android.telephony.TelephonyCallback
 import android.telephony.TelephonyManager
 import android.util.Log
 import androidx.core.content.ContextCompat
@@ -25,21 +33,23 @@ import org.kde.kdeconnect.helpers.ContactsHelper
 import org.kde.kdeconnect.plugins.Plugin
 import org.kde.kdeconnect.plugins.PluginFactory.LoadablePlugin
 import org.kde.kdeconnect_tp.R
-import android.provider.ContactsContract
 
 /**
- * Call control from the PC (no remote audio routing).
- *
- * Incoming: event packets with number/name/photo.
- * Commands: answer, decline/end, muteRinger, muteMic, speaker, dial, contacts.list
+ * Call control from PC (no remote audio routing).
+ * Dual-SIM aware: reports which SIM is ringing, and dial asks for a SIM.
  */
 @LoadablePlugin
 class CallBridgePlugin : Plugin() {
 
     private var lastState = TelephonyManager.CALL_STATE_IDLE
     private var lastNumber: String? = null
+    private var lastSubId: Int = SubscriptionManager.INVALID_SUBSCRIPTION_ID
     private var ringerMutedByUs = false
     private var previousRingerMode = AudioManager.RINGER_MODE_NORMAL
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var telephonyCallback: Any? = null
+    private var legacyListener: PhoneStateListener? = null
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent) {
@@ -52,15 +62,23 @@ class CallBridgePlugin : Plugin() {
                 else -> TelephonyManager.CALL_STATE_IDLE
             }
 
-            // Prefer broadcast that includes the number
             if (intent.hasExtra(TelephonyManager.EXTRA_INCOMING_NUMBER)) {
                 lastNumber = intent.getStringExtra(TelephonyManager.EXTRA_INCOMING_NUMBER)
             }
 
-            if (intState != lastState) {
-                lastState = intState
-                sendCallEvent(intState, lastNumber)
+            // Dual-SIM: subscription id if present
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
+                val sub = intent.getIntExtra("subscription", SubscriptionManager.INVALID_SUBSCRIPTION_ID)
+                if (sub != SubscriptionManager.INVALID_SUBSCRIPTION_ID) {
+                    lastSubId = sub
+                }
+                val sub2 = intent.getIntExtra(SubscriptionManager.EXTRA_SUBSCRIPTION_INDEX, SubscriptionManager.INVALID_SUBSCRIPTION_ID)
+                if (sub2 != SubscriptionManager.INVALID_SUBSCRIPTION_ID) {
+                    lastSubId = sub2
+                }
             }
+
+            onCallStateChanged(intState, lastNumber, lastSubId)
         }
     }
 
@@ -81,14 +99,22 @@ class CallBridgePlugin : Plugin() {
     override val isEnabledByDefault: Boolean = false
 
     override fun onCreate(): Boolean {
+        // Broadcast (number often arrives on a second broadcast)
         val filter = IntentFilter(TelephonyManager.ACTION_PHONE_STATE_CHANGED)
         filter.priority = 999
-        ContextCompat.registerReceiver(
-            context,
-            receiver,
-            filter,
-            ContextCompat.RECEIVER_EXPORTED
-        )
+        try {
+            ContextCompat.registerReceiver(
+                context,
+                receiver,
+                filter,
+                ContextCompat.RECEIVER_EXPORTED
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "registerReceiver failed", e)
+        }
+
+        // More reliable listener API
+        registerTelephonyListener()
         return true
     }
 
@@ -97,7 +123,79 @@ class CallBridgePlugin : Plugin() {
             context.unregisterReceiver(receiver)
         } catch (_: Exception) {
         }
+        unregisterTelephonyListener()
         restoreRingerIfNeeded()
+    }
+
+    private fun registerTelephonyListener() {
+        try {
+            val tm = context.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE)
+                    != PackageManager.PERMISSION_GRANTED
+                ) {
+                    Log.w(TAG, "READ_PHONE_STATE missing; listener not registered")
+                    return
+                }
+                val cb = object : TelephonyCallback(), TelephonyCallback.CallStateListener {
+                    override fun onCallStateChanged(state: Int) {
+                        onCallStateChanged(state, lastNumber, lastSubId)
+                    }
+                }
+                tm.registerTelephonyCallback(context.mainExecutor, cb)
+                telephonyCallback = cb
+            } else {
+                @Suppress("DEPRECATION")
+                val listener = object : PhoneStateListener() {
+                    @Deprecated("Deprecated in Java")
+                    override fun onCallStateChanged(state: Int, phoneNumber: String?) {
+                        if (!phoneNumber.isNullOrBlank()) lastNumber = phoneNumber
+                        onCallStateChanged(state, lastNumber, lastSubId)
+                    }
+                }
+                @Suppress("DEPRECATION")
+                tm.listen(listener, PhoneStateListener.LISTEN_CALL_STATE)
+                legacyListener = listener
+            }
+        } catch (e: Throwable) {
+            Log.e(TAG, "registerTelephonyListener failed", e)
+        }
+    }
+
+    private fun unregisterTelephonyListener() {
+        try {
+            val tm = context.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                (telephonyCallback as? TelephonyCallback)?.let {
+                    tm.unregisterTelephonyCallback(it)
+                }
+            } else {
+                @Suppress("DEPRECATION")
+                legacyListener?.let { tm.listen(it, PhoneStateListener.LISTEN_NONE) }
+            }
+        } catch (_: Throwable) {
+        }
+        telephonyCallback = null
+        legacyListener = null
+    }
+
+    private fun onCallStateChanged(state: Int, number: String?, subId: Int) {
+        // Always update number if we have one
+        if (!number.isNullOrBlank()) lastNumber = number
+        if (subId != SubscriptionManager.INVALID_SUBSCRIPTION_ID) lastSubId = subId
+
+        if (state == lastState && state != TelephonyManager.CALL_STATE_RINGING) {
+            // Still allow ringing updates when number arrives later
+            return
+        }
+        // If ringing again with new number, still emit
+        val numberChanged = state == TelephonyManager.CALL_STATE_RINGING &&
+            !number.isNullOrBlank() && number != lastNumber
+
+        if (state == lastState && !numberChanged) return
+
+        lastState = state
+        sendCallEvent(state, lastNumber, lastSubId)
     }
 
     override fun onPacketReceived(np: NetworkPacket): Boolean {
@@ -111,37 +209,21 @@ class CallBridgePlugin : Plugin() {
 
         try {
             when (action) {
-                "answer" -> {
-                    reply["body"] = answerCall().toString()
-                }
-                "decline", "end", "reject" -> {
-                    reply["body"] = endCall().toString()
-                }
-                "muteRinger" -> {
-                    reply["body"] = muteRinger(true).toString()
-                }
-                "unmuteRinger" -> {
-                    reply["body"] = muteRinger(false).toString()
-                }
-                "muteMic" -> {
-                    reply["body"] = setMicMuted(true).toString()
-                }
-                "unmuteMic" -> {
-                    reply["body"] = setMicMuted(false).toString()
-                }
-                "speakerOn" -> {
-                    reply["body"] = setSpeaker(true).toString()
-                }
-                "speakerOff" -> {
-                    reply["body"] = setSpeaker(false).toString()
-                }
+                "answer" -> reply["body"] = answerCall().toString()
+                "decline", "end", "reject" -> reply["body"] = endCall().toString()
+                "muteRinger" -> reply["body"] = muteRinger(true).toString()
+                "unmuteRinger" -> reply["body"] = muteRinger(false).toString()
+                "muteMic" -> reply["body"] = setMicMuted(true).toString()
+                "unmuteMic" -> reply["body"] = setMicMuted(false).toString()
+                "speakerOn" -> reply["body"] = setSpeaker(true).toString()
+                "speakerOff" -> reply["body"] = setSpeaker(false).toString()
                 "dial" -> {
                     val number = np.getString("number")
-                    reply["body"] = dial(number).toString()
+                    val subId = if (np.has("subscriptionId")) np.getInt("subscriptionId") else -1
+                    reply["body"] = dial(number, subId).toString()
                 }
-                "status" -> {
-                    reply["body"] = currentStatus().toString()
-                }
+                "status" -> reply["body"] = currentStatus().toString()
+                "sims.list" -> reply["body"] = listSims().toString()
                 "contacts.list" -> {
                     val query = np.getString("query", "")
                     reply["body"] = listContacts(query).toString()
@@ -157,7 +239,7 @@ class CallBridgePlugin : Plugin() {
         return true
     }
 
-    private fun sendCallEvent(state: Int, number: String?) {
+    private fun sendCallEvent(state: Int, number: String?, subId: Int) {
         val np = NetworkPacket(PACKET_TYPE)
         np["action"] = "event"
 
@@ -169,6 +251,12 @@ class CallBridgePlugin : Plugin() {
         np["event"] = event
         np["phoneNumber"] = number ?: ""
 
+        val sim = simInfo(subId)
+        np["subscriptionId"] = sim.optInt("subscriptionId", -1)
+        np["simSlot"] = sim.optInt("simSlot", -1)
+        np["simName"] = sim.optString("simName", "")
+        np["simCarrier"] = sim.optString("carrierName", "")
+
         var contactName = number ?: ""
         var photoBase64 = ""
 
@@ -177,9 +265,7 @@ class CallBridgePlugin : Plugin() {
             == PackageManager.PERMISSION_GRANTED
         ) {
             val lookup = ContactsHelper.phoneNumberLookup(context, number)
-            if (!lookup.name.isNullOrBlank()) {
-                contactName = lookup.name!!
-            }
+            if (!lookup.name.isNullOrBlank()) contactName = lookup.name!!
             photoBase64 = ContactsHelper.photoId64Encoded(context, lookup.photoId)
         }
 
@@ -188,12 +274,12 @@ class CallBridgePlugin : Plugin() {
             np["phoneThumbnail"] = photoBase64
         }
 
-        // Cancel flag used by desktop to close popup when idle
         if (event == "idle") {
             np["isCancel"] = true
             restoreRingerIfNeeded()
         }
 
+        Log.i(TAG, "sendCallEvent event=$event number=$number sim=${sim.optString("simName")}")
         device.sendPacket(np)
     }
 
@@ -208,11 +294,81 @@ class CallBridgePlugin : Plugin() {
             }
         )
         o.put("phoneNumber", lastNumber ?: "")
+        val sim = simInfo(lastSubId)
+        o.put("subscriptionId", sim.optInt("subscriptionId", -1))
+        o.put("simSlot", sim.optInt("simSlot", -1))
+        o.put("simName", sim.optString("simName", ""))
+        o.put("simCarrier", sim.optString("carrierName", ""))
         val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         o.put("micMuted", am.isMicrophoneMute)
         @Suppress("DEPRECATION")
         o.put("speakerOn", am.isSpeakerphoneOn)
         o.put("ringerMuted", ringerMutedByUs)
+        return o
+    }
+
+    private fun listSims(): JSONObject {
+        val o = JSONObject()
+        val arr = JSONArray()
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP_MR1) {
+            o.put("sims", arr)
+            o.put("count", 0)
+            return o
+        }
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            o.put("error", "READ_PHONE_STATE permission missing")
+            o.put("sims", arr)
+            return o
+        }
+        try {
+            val sm = context.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE) as SubscriptionManager
+            val list = sm.activeSubscriptionInfoList
+            list?.forEach { info ->
+                val item = JSONObject()
+                item.put("subscriptionId", info.subscriptionId)
+                item.put("simSlot", info.simSlotIndex) // 0-based
+                item.put("simName", info.displayName?.toString() ?: "SIM ${info.simSlotIndex + 1}")
+                item.put("carrierName", info.carrierName?.toString() ?: "")
+                item.put("number", info.number ?: "")
+                arr.put(item)
+            }
+        } catch (e: Throwable) {
+            o.put("error", e.message ?: "listSims failed")
+        }
+        o.put("sims", arr)
+        o.put("count", arr.length())
+        return o
+    }
+
+    private fun simInfo(subId: Int): JSONObject {
+        val o = JSONObject()
+        o.put("subscriptionId", subId)
+        o.put("simSlot", -1)
+        o.put("simName", "")
+        o.put("carrierName", "")
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP_MR1) return o
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE)
+            != PackageManager.PERMISSION_GRANTED
+        ) return o
+        try {
+            val sm = context.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE) as SubscriptionManager
+            val list = sm.activeSubscriptionInfoList ?: return o
+            val info = if (subId != SubscriptionManager.INVALID_SUBSCRIPTION_ID) {
+                list.firstOrNull { it.subscriptionId == subId }
+            } else {
+                null
+            }
+            val use = info ?: list.firstOrNull()
+            if (use != null) {
+                o.put("subscriptionId", use.subscriptionId)
+                o.put("simSlot", use.simSlotIndex)
+                o.put("simName", use.displayName?.toString() ?: "SIM ${use.simSlotIndex + 1}")
+                o.put("carrierName", use.carrierName?.toString() ?: "")
+            }
+        } catch (_: Throwable) {
+        }
         return o
     }
 
@@ -292,9 +448,7 @@ class CallBridgePlugin : Plugin() {
     }
 
     private fun restoreRingerIfNeeded() {
-        if (ringerMutedByUs) {
-            muteRinger(false)
-        }
+        if (ringerMutedByUs) muteRinger(false)
     }
 
     private fun setMicMuted(muted: Boolean): JSONObject {
@@ -318,7 +472,6 @@ class CallBridgePlugin : Plugin() {
         return try {
             @Suppress("DEPRECATION")
             am.isSpeakerphoneOn = on
-            // Keep in-call mode so speaker sticks during a call
             if (lastState == TelephonyManager.CALL_STATE_OFFHOOK) {
                 am.mode = AudioManager.MODE_IN_CALL
             }
@@ -332,7 +485,7 @@ class CallBridgePlugin : Plugin() {
         }
     }
 
-    private fun dial(number: String): JSONObject {
+    private fun dial(number: String, subscriptionId: Int): JSONObject {
         val o = JSONObject()
         if (number.isBlank()) {
             o.put("success", false)
@@ -347,18 +500,67 @@ class CallBridgePlugin : Plugin() {
             return o
         }
         return try {
-            // Supports normal numbers and *# USSD-style codes
             val uri = Uri.fromParts("tel", number, null)
+            val telecom = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
+
+            if (subscriptionId > 0 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                val handle = phoneAccountHandleForSubId(subscriptionId)
+                if (handle != null) {
+                    val extras = Bundle()
+                    extras.putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, handle)
+                    telecom.placeCall(uri, extras)
+                    o.put("success", true)
+                    o.put("number", number)
+                    o.put("subscriptionId", subscriptionId)
+                    o.put("method", "placeCall+sim")
+                    return o
+                }
+            }
+
+            // Fallback: default SIM / dialer
             val intent = Intent(Intent.ACTION_CALL, uri)
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            if (subscriptionId > 0 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                val handle = phoneAccountHandleForSubId(subscriptionId)
+                if (handle != null) {
+                    intent.putExtra(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, handle)
+                }
+            }
             context.startActivity(intent)
             o.put("success", true)
             o.put("number", number)
+            o.put("subscriptionId", subscriptionId)
+            o.put("method", "ACTION_CALL")
             o
         } catch (e: Throwable) {
             o.put("success", false)
             o.put("error", e.message ?: "dial failed")
             o
+        }
+    }
+
+    private fun phoneAccountHandleForSubId(subId: Int): PhoneAccountHandle? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return null
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE)
+            != PackageManager.PERMISSION_GRANTED
+        ) return null
+        return try {
+            val telecom = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
+            val accounts = telecom.callCapablePhoneAccounts
+            // Handles are often named with subscription id in id string
+            accounts.firstOrNull { handle ->
+                handle.id.contains(subId.toString())
+            } ?: run {
+                // Fallback: match by slot order
+                val sm = context.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE) as SubscriptionManager
+                val info = sm.activeSubscriptionInfoList?.firstOrNull { it.subscriptionId == subId }
+                if (info != null && info.simSlotIndex in accounts.indices) {
+                    accounts[info.simSlotIndex]
+                } else null
+            }
+        } catch (e: Throwable) {
+            Log.e(TAG, "phoneAccountHandleForSubId failed", e)
+            null
         }
     }
 
@@ -376,8 +578,7 @@ class CallBridgePlugin : Plugin() {
             val cr = context.contentResolver
             val projection = arrayOf(
                 ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
-                ContactsContract.CommonDataKinds.Phone.NUMBER,
-                ContactsContract.CommonDataKinds.Phone.TYPE
+                ContactsContract.CommonDataKinds.Phone.NUMBER
             )
             val selection: String?
             val args: Array<String>?
@@ -424,11 +625,11 @@ class CallBridgePlugin : Plugin() {
         Manifest.permission.READ_PHONE_STATE,
         Manifest.permission.CALL_PHONE,
         Manifest.permission.ANSWER_PHONE_CALLS,
+        Manifest.permission.READ_CALL_LOG, // needed on many phones to get incoming number
     )
 
     override val optionalPermissions: Array<String> = arrayOf(
         Manifest.permission.READ_CONTACTS,
-        Manifest.permission.READ_CALL_LOG,
     )
 
     companion object {
