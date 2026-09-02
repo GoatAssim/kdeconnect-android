@@ -721,7 +721,8 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
     <string name="pref_plugin_shizuku">Shizuku privileged access</string>
     <string name="pref_plugin_shizuku_desc">Control hotspot, Wi-Fi, Bluetooth, install apps and more using Shizuku</string>
     <string name="shizuku_button">Shizuku controls</string>
-
+    <string name="pref_plugin_callbridge">Call Bridge</string>
+    <string name="pref_plugin_callbridge_desc">Answer, decline and place phone calls from your computer</string>
     <string name="pref_plugin_tailscale">Tailscale</string>
     <string name="pref_plugin_tailscale_desc">Connect over Tailscale and set the remote Tailscale IP</string>
     <string name="tailscale_button">Tailscale</string>
