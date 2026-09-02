@@ -722,4 +722,9 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
     <string name="pref_mpris_volume_control_key" translatable="false">mpris_volume_control_enabled</string>
     <string name="pref_mpris_volume_control_title">Hardware volume keys</string>
     <string name="pref_mpris_volume_control_summary">Control the connected device\'s media volume using this phone\'s hardware buttons</string>
+    <string name="pref_plugin_shizuku">Shizuku privileged access</string>
+    <string name="pref_plugin_shizuku_desc">Control hotspot, Wi-Fi, Bluetooth, install apps and more using Shizuku (ADB privileges)</string>
+    <string name="pref_plugin_tailscale">Tailscale</string>
+    <string name="pref_plugin_tailscale_desc">Connect over Tailscale and control the VPN. Set the remote Tailscale IP so the device is always reachable.</string>
+
 </resources>
