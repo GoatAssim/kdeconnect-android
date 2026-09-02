@@ -155,51 +155,6 @@ object ShizukuHelper {
         }
     }
 
-    /**
-     * Run a shell command as the Shizuku identity (shell/root).
-     * Returns (exitCode, stdout, stderr), or null if Shizuku is not ready.
-     */
-    fun runShell(vararg cmd: String): Triple<Int, String, String>? {
-        return try {
-            if (!isAvailable() || !isPermissionGranted()) {
-                Log.w(TAG, "runShell: Shizuku not available or permission not granted")
-                return null
-            }
-            val shizukuClass = Class.forName("rikka.shizuku.Shizuku")
-            val newProcess = shizukuClass.getMethod(
-                "newProcess",
-                Array<String>::class.java,
-                Array<String>::class.java,
-                String::class.java
-            )
-            val process = newProcess.invoke(null, cmd, null, null) as Process
-            val exit = process.waitFor()
-            val stdout = process.inputStream.bufferedReader().use { it.readText() }
-            val stderr = process.errorStream.bufferedReader().use { it.readText() }
-            Triple(exit, stdout, stderr)
-        } catch (e: ClassNotFoundException) {
-            Log.w(TAG, "Shizuku classes not found – add the dependency")
-            null
-        } catch (e: Throwable) {
-            Log.e(TAG, "runShell failed for: ${cmd.joinToString(" ")}", e)
-            null
-        }
-    }
-
-    /**
-     * Try several command variants; return the first that succeeds (exit 0),
-     * or the last result if all fail. Null only if Shizuku itself is unavailable.
-     */
-    fun runShellFirstSuccess(vararg variants: Array<String>): Triple<Int, String, String>? {
-        var last: Triple<Int, String, String>? = null
-        for (cmd in variants) {
-            val r = runShell(*cmd) ?: return null
-            last = r
-            if (r.first == 0) return r
-        }
-        return last
-    }
-
     fun getUid(): Int {
         return try {
             val shizuku = Class.forName("rikka.shizuku.Shizuku")

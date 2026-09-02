@@ -35,17 +35,26 @@ class BluetoothController(private val context: Context) {
             }
 
             result.put("enabled", a.isEnabled)
-            result.put("state", when (a.state) {
-                BluetoothAdapter.STATE_OFF -> "off"
-                BluetoothAdapter.STATE_TURNING_ON -> "turning_on"
-                BluetoothAdapter.STATE_ON -> "on"
-                BluetoothAdapter.STATE_TURNING_OFF -> "turning_off"
-                else -> "unknown"
-            })
+            result.put(
+                "state",
+                when (a.state) {
+                    BluetoothAdapter.STATE_OFF -> "off"
+                    BluetoothAdapter.STATE_TURNING_ON -> "turning_on"
+                    BluetoothAdapter.STATE_ON -> "on"
+                    BluetoothAdapter.STATE_TURNING_OFF -> "turning_off"
+                    else -> "unknown"
+                }
+            )
             result.put("name", a.name ?: "")
-            result.put("address", try { a.address } catch (_: SecurityException) { "permission_denied" })
+            result.put(
+                "address",
+                try {
+                    a.address
+                } catch (_: SecurityException) {
+                    "permission_denied"
+                }
+            )
 
-            // Bonded devices
             val bonded = JSONArray()
             try {
                 a.bondedDevices?.forEach { device ->
@@ -70,17 +79,55 @@ class BluetoothController(private val context: Context) {
     fun setEnabled(enabled: Boolean): JSONObject {
         val result = JSONObject()
         try {
-            val a = adapter
-            if (a == null) {
-                result.put("error", "BluetoothAdapter unavailable")
+            val svcArg = if (enabled) "enable" else "disable"
+
+            val r = ShizukuHelper.runShellFirstSuccess(
+                arrayOf("svc", "bluetooth", svcArg),
+                arrayOf("cmd", "bluetooth_manager", "enable"), // enable-only variant on some ROMs
+            )
+
+            // For disable, only svc is reliable; if enable path used wrong cmd when disabling, fix:
+            val shellResult = if (enabled) {
+                r
+            } else {
+                ShizukuHelper.runShell("svc", "bluetooth", "disable")
+            }
+
+            if (shellResult == null) {
+                val a = adapter
+                if (a == null) {
+                    result.put("success", false)
+                    result.put("error", "Shizuku not available and BluetoothAdapter unavailable")
+                    return result
+                }
+                val ok = if (enabled) a.enable() else a.disable()
+                result.put("success", ok)
+                result.put("enabled", enabled)
+                result.put("method", "BluetoothAdapter")
+                if (!ok) {
+                    result.put(
+                        "error",
+                        "BluetoothAdapter enable/disable returned false (need Shizuku running + permission)"
+                    )
+                }
                 return result
             }
-            val ok = if (enabled) a.enable() else a.disable()
-            result.put("success", ok)
+
+            val (exit, stdout, stderr) = shellResult
+            result.put("success", exit == 0)
+            result.put("exitCode", exit)
+            result.put("stdout", stdout)
+            result.put("stderr", stderr)
             result.put("enabled", enabled)
+            result.put("method", "shizuku-shell")
+            if (exit != 0) {
+                result.put("error", stderr.ifBlank { "bluetooth toggle failed with code $exit" })
+            }
         } catch (e: SecurityException) {
+            result.put("success", false)
             result.put("error", "Missing BLUETOOTH_CONNECT / BLUETOOTH_ADMIN permission")
         } catch (e: Throwable) {
+            result.put("success", false)
             result.put("error", e.message ?: "Failed to toggle Bluetooth")
         }
         return result

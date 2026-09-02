@@ -30,7 +30,6 @@ class WifiController(private val context: Context) {
             result.put("enabled", wm.isWifiEnabled)
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                // Modern way via ConnectivityManager
                 val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
                 val network = cm.activeNetwork
                 val caps = network?.let { cm.getNetworkCapabilities(it) }
@@ -55,7 +54,6 @@ class WifiController(private val context: Context) {
                 }
             }
 
-            // Signal strength (best effort)
             try {
                 @Suppress("DEPRECATION")
                 val info = wm.connectionInfo
@@ -111,16 +109,49 @@ class WifiController(private val context: Context) {
     fun setEnabled(enabled: Boolean): JSONObject {
         val result = JSONObject()
         try {
-            val wm = wifiManager
-            if (wm == null) {
-                result.put("error", "WifiManager unavailable")
+            // Prefer Shizuku shell – app-process setWifiEnabled returns false on modern Android
+            val state = if (enabled) "enabled" else "disabled"
+            val svcArg = if (enabled) "enable" else "disable"
+
+            val r = ShizukuHelper.runShellFirstSuccess(
+                arrayOf("cmd", "wifi", "set-wifi-enabled", state),
+                arrayOf("svc", "wifi", svcArg),
+            )
+
+            if (r == null) {
+                // Fallback (usually fails without system privilege)
+                val wm = wifiManager
+                if (wm == null) {
+                    result.put("success", false)
+                    result.put("error", "Shizuku not available and WifiManager unavailable")
+                    return result
+                }
+                @Suppress("DEPRECATION")
+                val ok = wm.setWifiEnabled(enabled)
+                result.put("success", ok)
+                result.put("enabled", enabled)
+                result.put("method", "WifiManager.setWifiEnabled")
+                if (!ok) {
+                    result.put(
+                        "error",
+                        "setWifiEnabled returned false (need Shizuku running + permission granted to KDE Connect)"
+                    )
+                }
                 return result
             }
-            @Suppress("DEPRECATION")
-            val ok = wm.setWifiEnabled(enabled)
-            result.put("success", ok)
+
+            val (exit, stdout, stderr) = r
+            result.put("success", exit == 0)
+            result.put("exitCode", exit)
+            result.put("stdout", stdout)
+            result.put("stderr", stderr)
             result.put("enabled", enabled)
+            result.put("method", "shizuku-shell")
+            if (exit != 0) {
+                result.put("error", stderr.ifBlank { "wifi toggle failed with code $exit" })
+            }
         } catch (e: Throwable) {
+            result.put("success", false)
             result.put("error", e.message ?: "Failed to toggle WiFi")
         }
         return result
