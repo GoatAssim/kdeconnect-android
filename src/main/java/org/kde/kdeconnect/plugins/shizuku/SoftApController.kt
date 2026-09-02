@@ -15,7 +15,7 @@ import java.lang.reflect.Method
 
 /**
  * SoftAP / hotspot control.
- * Mutations go through Shizuku shell first; reflection is kept as a secondary path.
+ * Mutations prefer Shizuku shell; reflection is only a secondary path.
  */
 class SoftApController(private val context: Context) {
 
@@ -24,8 +24,15 @@ class SoftApController(private val context: Context) {
     private val wifiManager: WifiManager?
         get() = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
 
+    private fun putShizukuMeta(result: JSONObject) {
+        result.put("shizukuAvailable", ShizukuHelper.isAvailable())
+        result.put("shizukuPermission", ShizukuHelper.isPermissionGranted())
+        result.put("shizukuUid", ShizukuHelper.getUid())
+    }
+
     fun getStatus(): JSONObject {
         val result = JSONObject()
+        putShizukuMeta(result)
         try {
             val wm = wifiManager
             if (wm == null) {
@@ -42,13 +49,14 @@ class SoftApController(private val context: Context) {
             }
             result.put("enabled", enabled)
 
-            // Also try shell status (best-effort)
-            try {
-                val r = ShizukuHelper.runShell("cmd", "wifi", "status")
-                if (r != null) {
-                    result.put("shellStdout", r.second)
-                }
-            } catch (_: Throwable) {
+            // Best-effort shell status
+            val shell = ShizukuHelper.runShell("cmd", "wifi", "status")
+            if (shell != null) {
+                result.put("shellExit", shell.first)
+                result.put("shellStdout", shell.second)
+                result.put("shellStderr", shell.third)
+            } else {
+                result.put("shellError", ShizukuHelper.notReadyReason() ?: "shell unavailable")
             }
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -75,6 +83,7 @@ class SoftApController(private val context: Context) {
 
     fun getConfig(): JSONObject {
         val result = JSONObject()
+        putShizukuMeta(result)
         try {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
                 result.put("error", "SoftApConfiguration requires Android 11+")
@@ -103,13 +112,16 @@ class SoftApController(private val context: Context) {
      */
     fun setConfig(params: JSONObject): JSONObject {
         val result = JSONObject()
+        putShizukuMeta(result)
         try {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
                 result.put("error", "SoftApConfiguration requires Android 11+")
+                result.put("success", false)
                 return result
             }
             val wm = wifiManager ?: run {
                 result.put("error", "WifiManager unavailable")
+                result.put("success", false)
                 return result
             }
 
@@ -200,15 +212,17 @@ class SoftApController(private val context: Context) {
             val newConfig = builderClass.getMethod("build").invoke(builder)
             val ok = setSoftApConfigurationReflect(wm, newConfig)
             result.put("success", ok)
+            result.put("method", "WifiManager.setSoftApConfiguration")
             if (ok && newConfig != null) {
                 putConfigInto(result, newConfig)
             } else if (!ok) {
                 result.put(
                     "error",
-                    "setSoftApConfiguration returned false (OEM may require different shell path)"
+                    "setSoftApConfiguration returned false (needs system privilege on many OEMs; shell config not standardized)"
                 )
             }
         } catch (e: Throwable) {
+            result.put("success", false)
             result.put("error", e.message ?: "Failed to set SoftApConfiguration")
             Log.e(TAG, "setConfig failed", e)
         }
@@ -217,125 +231,172 @@ class SoftApController(private val context: Context) {
 
     fun start(): JSONObject {
         val result = JSONObject()
+        putShizukuMeta(result)
+
+        val notReady = ShizukuHelper.notReadyReason()
+        if (notReady != null) {
+            result.put("success", false)
+            result.put("error", notReady)
+            result.put("method", "none")
+            return result
+        }
+
+        // Try several shell variants used across AOSP / OEM builds
+        val r = ShizukuHelper.runShellFirstSuccess(
+            arrayOf("cmd", "connectivity", "tethering-start", "wifi"),
+            arrayOf("cmd", "wifi", "start-softap"),
+            arrayOf("cmd", "wifi", "start-softap", "AndroidAP", "12345678"),
+            arrayOf("svc", "wifi", "enable"), // weak last resort; may only enable station wifi
+        )
+
+        if (r == null) {
+            result.put("success", false)
+            result.put("error", ShizukuHelper.notReadyReason() ?: "runShell returned null")
+            result.put("method", "none")
+            return result
+        }
+
+        val (exit, stdout, stderr) = r
+        if (exit == 0) {
+            result.put("success", true)
+            result.put("exitCode", exit)
+            result.put("stdout", stdout)
+            result.put("stderr", stderr)
+            result.put("method", "shizuku-shell")
+            return result
+        }
+
+        // Reflection fallback (often missing on modern Android)
         try {
-            // Shizuku shell first (works on many devices)
-            val r = ShizukuHelper.runShellFirstSuccess(
-                arrayOf("cmd", "wifi", "start-softap"),
-                arrayOf("svc", "wifi", "enable"), // weak fallback, not real softap
-            )
-
-            if (r != null && r.first == 0) {
-                result.put("success", true)
-                result.put("exitCode", r.first)
-                result.put("stdout", r.second)
-                result.put("stderr", r.third)
-                result.put("method", "shizuku-shell")
-                return result
-            }
-
-            // Reflection fallback
-            val wm = wifiManager ?: run {
-                result.put("success", false)
-                result.put("error", "WifiManager unavailable")
-                if (r != null) {
-                    result.put("shellExit", r.first)
-                    result.put("shellStderr", r.third)
-                }
-                return result
-            }
-            try {
-                val method = wm.javaClass.getMethod(
-                    "startSoftAp",
-                    Class.forName("android.net.wifi.WifiConfiguration")
-                )
-                val ok = method.invoke(wm, null as Any?) as Boolean
-                result.put("success", ok)
-                result.put("method", "startSoftAp")
-                if (!ok) {
-                    result.put(
-                        "error",
-                        "startSoftAp returned false. Shell also failed: ${r?.third ?: "no shell"}"
+            val wm = wifiManager
+            if (wm != null) {
+                try {
+                    val method = wm.javaClass.getMethod(
+                        "startSoftAp",
+                        Class.forName("android.net.wifi.WifiConfiguration")
                     )
-                }
-            } catch (e: Throwable) {
-                result.put("success", false)
-                result.put("error", "Could not start SoftAP: ${e.message}")
-                if (r != null) {
-                    result.put("shellExit", r.first)
-                    result.put("shellStderr", r.third)
+                    val ok = method.invoke(wm, null as Any?) as Boolean
+                    result.put("success", ok)
+                    result.put("method", "startSoftAp-reflection")
+                    result.put("shellExit", exit)
+                    result.put("shellStdout", stdout)
+                    result.put("shellStderr", stderr)
+                    if (!ok) {
+                        result.put(
+                            "error",
+                            "shell failed ($exit): ${stderr.ifBlank { stdout }} | startSoftAp returned false"
+                        )
+                    }
+                    return result
+                } catch (e: Throwable) {
+                    result.put("reflectionError", e.message ?: e.toString())
                 }
             }
         } catch (e: Throwable) {
-            result.put("success", false)
-            result.put("error", e.message ?: "start failed")
+            result.put("reflectionError", e.message ?: e.toString())
         }
+
+        result.put("success", false)
+        result.put("exitCode", exit)
+        result.put("stdout", stdout)
+        result.put("stderr", stderr)
+        result.put("method", "shizuku-shell")
+        result.put(
+            "error",
+            stderr.ifBlank {
+                "All hotspot start commands failed (exit $exit). OEM may need a different cmd."
+            }
+        )
         return result
     }
 
     fun stop(): JSONObject {
         val result = JSONObject()
+        putShizukuMeta(result)
+
+        val notReady = ShizukuHelper.notReadyReason()
+        if (notReady != null) {
+            result.put("success", false)
+            result.put("error", notReady)
+            result.put("method", "none")
+            return result
+        }
+
+        val r = ShizukuHelper.runShellFirstSuccess(
+            arrayOf("cmd", "connectivity", "tethering-stop", "wifi"),
+            arrayOf("cmd", "wifi", "stop-softap"),
+        )
+
+        if (r == null) {
+            result.put("success", false)
+            result.put("error", ShizukuHelper.notReadyReason() ?: "runShell returned null")
+            result.put("method", "none")
+            return result
+        }
+
+        val (exit, stdout, stderr) = r
+        if (exit == 0) {
+            result.put("success", true)
+            result.put("exitCode", exit)
+            result.put("stdout", stdout)
+            result.put("stderr", stderr)
+            result.put("method", "shizuku-shell")
+            return result
+        }
+
         try {
-            val r = ShizukuHelper.runShellFirstSuccess(
-                arrayOf("cmd", "wifi", "stop-softap"),
-                arrayOf("cmd", "connectivity", "tethering-stop", "wifi"),
-            )
-
-            if (r != null && r.first == 0) {
-                result.put("success", true)
-                result.put("exitCode", r.first)
-                result.put("stdout", r.second)
-                result.put("stderr", r.third)
-                result.put("method", "shizuku-shell")
-                return result
-            }
-
-            val wm = wifiManager ?: run {
-                result.put("success", false)
-                result.put("error", "WifiManager unavailable")
-                if (r != null) {
-                    result.put("shellExit", r.first)
-                    result.put("shellStderr", r.third)
-                }
-                return result
-            }
-            try {
-                val method = wm.javaClass.getMethod("stopSoftAp")
-                val ok = method.invoke(wm) as Boolean
-                result.put("success", ok)
-                result.put("method", "stopSoftAp")
-                if (!ok) {
-                    result.put(
-                        "error",
-                        "stopSoftAp returned false. Shell also failed: ${r?.third ?: "no shell"}"
-                    )
-                }
-            } catch (e: Throwable) {
-                result.put("success", false)
-                result.put("error", "Could not stop SoftAP: ${e.message}")
-                if (r != null) {
-                    result.put("shellExit", r.first)
-                    result.put("shellStderr", r.third)
+            val wm = wifiManager
+            if (wm != null) {
+                try {
+                    val method = wm.javaClass.getMethod("stopSoftAp")
+                    val ok = method.invoke(wm) as Boolean
+                    result.put("success", ok)
+                    result.put("method", "stopSoftAp-reflection")
+                    result.put("shellExit", exit)
+                    result.put("shellStdout", stdout)
+                    result.put("shellStderr", stderr)
+                    if (!ok) {
+                        result.put(
+                            "error",
+                            "shell failed ($exit): ${stderr.ifBlank { stdout }} | stopSoftAp returned false"
+                        )
+                    }
+                    return result
+                } catch (e: Throwable) {
+                    result.put("reflectionError", e.message ?: e.toString())
                 }
             }
         } catch (e: Throwable) {
-            result.put("success", false)
-            result.put("error", e.message ?: "stop failed")
+            result.put("reflectionError", e.message ?: e.toString())
         }
+
+        result.put("success", false)
+        result.put("exitCode", exit)
+        result.put("stdout", stdout)
+        result.put("stderr", stderr)
+        result.put("method", "shizuku-shell")
+        result.put(
+            "error",
+            stderr.ifBlank { "All hotspot stop commands failed (exit $exit)" }
+        )
         return result
     }
 
     fun getConnectedClients(): JSONObject {
         val result = JSONObject()
+        putShizukuMeta(result)
         result.put("clients", JSONArray())
-        result.put("note", "Live client list requires SoftApCallback (next iteration)")
+        result.put("note", "Live client list requires SoftApCallback (not implemented yet)")
         return result
     }
 
     fun banClient(mac: String): JSONObject {
         val result = JSONObject()
+        putShizukuMeta(result)
         try {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
                 result.put("error", "Client blocking requires Android 12+")
+                result.put("success", false)
                 return result
             }
             val current = getConfig()
@@ -352,6 +413,7 @@ class SoftApController(private val context: Context) {
             params.put("blockedClients", JSONArray(blocked))
             return setConfig(params)
         } catch (e: Throwable) {
+            result.put("success", false)
             result.put("error", e.message ?: "banClient failed")
         }
         return result
@@ -359,9 +421,11 @@ class SoftApController(private val context: Context) {
 
     fun unbanClient(mac: String): JSONObject {
         val result = JSONObject()
+        putShizukuMeta(result)
         try {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
                 result.put("error", "Client blocking requires Android 12+")
+                result.put("success", false)
                 return result
             }
             val current = getConfig()
@@ -380,6 +444,7 @@ class SoftApController(private val context: Context) {
             params.put("blockedClients", JSONArray(blocked))
             return setConfig(params)
         } catch (e: Throwable) {
+            result.put("success", false)
             result.put("error", e.message ?: "unbanClient failed")
         }
         return result
@@ -387,8 +452,7 @@ class SoftApController(private val context: Context) {
 
     private fun getSoftApConfigurationReflect(wm: WifiManager): Any? {
         return try {
-            val m = wm.javaClass.getMethod("getSoftApConfiguration")
-            m.invoke(wm)
+            wm.javaClass.getMethod("getSoftApConfiguration").invoke(wm)
         } catch (e: Throwable) {
             Log.w(TAG, "getSoftApConfiguration failed", e)
             null
@@ -397,11 +461,10 @@ class SoftApController(private val context: Context) {
 
     private fun setSoftApConfigurationReflect(wm: WifiManager, config: Any?): Boolean {
         return try {
-            val m = wm.javaClass.getMethod(
+            wm.javaClass.getMethod(
                 "setSoftApConfiguration",
                 Class.forName("android.net.wifi.SoftApConfiguration")
-            )
-            m.invoke(wm, config) as Boolean
+            ).invoke(wm, config) as Boolean
         } catch (e: Throwable) {
             Log.w(TAG, "setSoftApConfiguration failed", e)
             false
@@ -409,33 +472,26 @@ class SoftApController(private val context: Context) {
     }
 
     private fun callBuilder(builder: Any, method: String, types: Array<Class<*>>, vararg args: Any?) {
-        val m = builder.javaClass.getMethod(method, *types)
-        m.invoke(builder, *args)
+        builder.javaClass.getMethod(method, *types).invoke(builder, *args)
     }
 
     private fun putConfigInto(target: JSONObject, config: Any) {
         try {
             val c = config.javaClass
-            fun invokeStr(name: String): String {
-                return try {
-                    (c.getMethod(name).invoke(config) as? String) ?: ""
-                } catch (_: Throwable) {
-                    ""
-                }
+            fun invokeStr(name: String): String = try {
+                (c.getMethod(name).invoke(config) as? String) ?: ""
+            } catch (_: Throwable) {
+                ""
             }
-            fun invokeInt(name: String): Int {
-                return try {
-                    c.getMethod(name).invoke(config) as? Int ?: -1
-                } catch (_: Throwable) {
-                    -1
-                }
+            fun invokeInt(name: String): Int = try {
+                c.getMethod(name).invoke(config) as? Int ?: -1
+            } catch (_: Throwable) {
+                -1
             }
-            fun invokeBool(name: String): Boolean {
-                return try {
-                    c.getMethod(name).invoke(config) as? Boolean ?: false
-                } catch (_: Throwable) {
-                    false
-                }
+            fun invokeBool(name: String): Boolean = try {
+                c.getMethod(name).invoke(config) as? Boolean ?: false
+            } catch (_: Throwable) {
+                false
             }
 
             target.put("ssid", invokeStr("getSsid"))
@@ -447,9 +503,7 @@ class SoftApController(private val context: Context) {
                 try {
                     val list = c.getMethod("getBlockedClientList").invoke(config) as? List<*>
                     val arr = JSONArray()
-                    list?.forEach { mac ->
-                        arr.put(mac?.toString() ?: "")
-                    }
+                    list?.forEach { mac -> arr.put(mac?.toString() ?: "") }
                     target.put("blockedClients", arr)
                 } catch (_: Throwable) {
                 }

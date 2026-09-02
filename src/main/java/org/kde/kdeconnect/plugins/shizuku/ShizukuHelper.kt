@@ -9,115 +9,72 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.IBinder
 import android.util.Log
+import rikka.shizuku.Shizuku
+import rikka.shizuku.ShizukuBinderWrapper
+import rikka.shizuku.SystemServiceHelper
 
-/**
- * Central helper for Shizuku.
- * Uses reflection so the project still compiles if the Shizuku AAR is not
- * yet on the classpath; at runtime it works once the dependency is added
- * and Shizuku is running.
- */
 object ShizukuHelper {
 
     private const val TAG = "ShizukuHelper"
-    const val REQUEST_CODE_PERMISSION = 0x5348 // "SH"
+    const val REQUEST_CODE_PERMISSION = 0x5348
 
     @Volatile
     private var binderReady = false
 
-    private var binderReceivedListener: Any? = null
-    private var binderDeadListener: Any? = null
+    private val binderReceivedListener = Shizuku.OnBinderReceivedListener {
+        binderReady = true
+        Log.i(TAG, "Shizuku binder received")
+    }
+
+    private val binderDeadListener = Shizuku.OnBinderDeadListener {
+        binderReady = false
+        Log.w(TAG, "Shizuku binder dead")
+    }
 
     fun init(context: Context) {
         try {
-            val shizuku = Class.forName("rikka.shizuku.Shizuku")
-
-            // OnBinderReceivedListener
-            val receivedIface = Class.forName("rikka.shizuku.Shizuku\$OnBinderReceivedListener")
-            binderReceivedListener = java.lang.reflect.Proxy.newProxyInstance(
-                receivedIface.classLoader,
-                arrayOf(receivedIface)
-            ) { _, method, _ ->
-                if (method.name == "onBinderReceived") {
-                    binderReady = true
-                    Log.i(TAG, "Shizuku binder received")
-                }
-                null
+            Shizuku.addBinderReceivedListenerSticky(binderReceivedListener)
+            Shizuku.addBinderDeadListener(binderDeadListener)
+            if (Shizuku.pingBinder()) {
+                binderReady = true
             }
-            shizuku.getMethod("addBinderReceivedListenerSticky", receivedIface)
-                .invoke(null, binderReceivedListener)
-
-            // OnBinderDeadListener
-            val deadIface = Class.forName("rikka.shizuku.Shizuku\$OnBinderDeadListener")
-            binderDeadListener = java.lang.reflect.Proxy.newProxyInstance(
-                deadIface.classLoader,
-                arrayOf(deadIface)
-            ) { _, method, _ ->
-                if (method.name == "onBinderDead") {
-                    binderReady = false
-                    Log.w(TAG, "Shizuku binder dead")
-                }
-                null
-            }
-            shizuku.getMethod("addBinderDeadListener", deadIface)
-                .invoke(null, binderDeadListener)
-
-            val ping = shizuku.getMethod("pingBinder").invoke(null) as Boolean
-            if (ping) binderReady = true
-        } catch (e: ClassNotFoundException) {
-            Log.w(TAG, "Shizuku library not on classpath – add dev.rikka.shizuku:api dependency")
+            Log.i(TAG, "init done available=${isAvailable()} permission=${isPermissionGranted()} uid=${getUid()}")
         } catch (e: Throwable) {
-            Log.e(TAG, "Failed to init Shizuku listeners", e)
+            Log.e(TAG, "Failed to init Shizuku", e)
         }
     }
 
     fun destroy() {
         try {
-            val shizuku = Class.forName("rikka.shizuku.Shizuku")
-            binderReceivedListener?.let {
-                val iface = Class.forName("rikka.shizuku.Shizuku\$OnBinderReceivedListener")
-                shizuku.getMethod("removeBinderReceivedListener", iface).invoke(null, it)
-            }
-            binderDeadListener?.let {
-                val iface = Class.forName("rikka.shizuku.Shizuku\$OnBinderDeadListener")
-                shizuku.getMethod("removeBinderDeadListener", iface).invoke(null, it)
-            }
+            Shizuku.removeBinderReceivedListener(binderReceivedListener)
+            Shizuku.removeBinderDeadListener(binderDeadListener)
         } catch (_: Throwable) {
         }
         binderReady = false
-        binderReceivedListener = null
-        binderDeadListener = null
     }
 
     fun isAvailable(): Boolean {
         return try {
-            val shizuku = Class.forName("rikka.shizuku.Shizuku")
-            shizuku.getMethod("pingBinder").invoke(null) as Boolean
-        } catch (_: Throwable) {
+            Shizuku.pingBinder()
+        } catch (e: Throwable) {
+            Log.w(TAG, "isAvailable failed", e)
             false
         }
     }
 
     fun isPermissionGranted(): Boolean {
         return try {
-            val shizuku = Class.forName("rikka.shizuku.Shizuku")
-            val result = shizuku.getMethod("checkSelfPermission").invoke(null) as Int
-            result == PackageManager.PERMISSION_GRANTED
-        } catch (_: Throwable) {
+            Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+        } catch (e: Throwable) {
+            Log.w(TAG, "isPermissionGranted failed", e)
             false
         }
     }
 
     fun requestPermission() {
         try {
-            val shizuku = Class.forName("rikka.shizuku.Shizuku")
-            val isPreV11 = try {
-                shizuku.getMethod("isPreV11").invoke(null) as Boolean
-            } catch (_: Throwable) {
-                false
-            }
-            if (isPreV11) return
-            shizuku.getMethod("requestPermission", Int::class.javaPrimitiveType)
-                .invoke(null, REQUEST_CODE_PERMISSION)
+            if (Shizuku.isPreV11()) return
+            Shizuku.requestPermission(REQUEST_CODE_PERMISSION)
         } catch (e: Throwable) {
             Log.e(TAG, "requestPermission failed", e)
         }
@@ -125,72 +82,57 @@ object ShizukuHelper {
 
     fun getService(name: String): IBinder? {
         return try {
-            if (!isAvailable() || !isPermissionGranted()) {
-                Log.w(TAG, "Shizuku not ready for service $name")
-                return null
-            }
-            val helper = Class.forName("rikka.shizuku.SystemServiceHelper")
-            val raw = helper.getMethod("getSystemService", String::class.java).invoke(null, name) as? IBinder
-                ?: return null
-            val wrapperClass = Class.forName("rikka.shizuku.ShizukuBinderWrapper")
-            wrapperClass.getConstructor(IBinder::class.java).newInstance(raw) as IBinder
+            if (!isAvailable() || !isPermissionGranted()) return null
+            val raw = SystemServiceHelper.getSystemService(name) ?: return null
+            ShizukuBinderWrapper(raw)
         } catch (e: Throwable) {
             Log.e(TAG, "getService($name) failed", e)
             null
         }
     }
 
-    fun <T> runPrivileged(block: () -> T): Result<T> {
+    /**
+     * Why shell cannot run right now (null = OK to run).
+     */
+    fun notReadyReason(): String? {
         return try {
-            if (!isAvailable()) {
-                return Result.failure(IllegalStateException("Shizuku is not running"))
+            if (!Shizuku.pingBinder()) {
+                "Shizuku binder not connected (is Shizuku app running?)"
+            } else if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
+                "Shizuku permission not granted to KDE Connect (open Shizuku app → Apps → allow KDE Connect)"
+            } else {
+                null
             }
-            if (!isPermissionGranted()) {
-                return Result.failure(SecurityException("Shizuku permission not granted"))
-            }
-            Result.success(block())
         } catch (e: Throwable) {
-            Log.e(TAG, "Privileged call failed", e)
-            Result.failure(e)
+            "Shizuku API error: ${e.message}"
         }
     }
 
     /**
-     * Run a shell command as the Shizuku identity (shell/root).
-     * Returns (exitCode, stdout, stderr), or null if Shizuku is not ready.
+     * (exitCode, stdout, stderr) or null if Shizuku not ready.
+     * On failure, check notReadyReason() / logs.
      */
     fun runShell(vararg cmd: String): Triple<Int, String, String>? {
+        val reason = notReadyReason()
+        if (reason != null) {
+            Log.w(TAG, "runShell blocked: $reason | cmd=${cmd.joinToString(" ")}")
+            return null
+        }
         return try {
-            if (!isAvailable() || !isPermissionGranted()) {
-                Log.w(TAG, "runShell: Shizuku not available or permission not granted")
-                return null
-            }
-            val shizukuClass = Class.forName("rikka.shizuku.Shizuku")
-            val newProcess = shizukuClass.getMethod(
-                "newProcess",
-                Array<String>::class.java,
-                Array<String>::class.java,
-                String::class.java
-            )
-            val process = newProcess.invoke(null, cmd, null, null) as Process
+            val process = Shizuku.newProcess(arrayOf(*cmd), null, null)
             val exit = process.waitFor()
             val stdout = process.inputStream.bufferedReader().use { it.readText() }
             val stderr = process.errorStream.bufferedReader().use { it.readText() }
+            Log.i(TAG, "runShell exit=$exit cmd=${cmd.joinToString(" ")} stderr=$stderr")
             Triple(exit, stdout, stderr)
-        } catch (e: ClassNotFoundException) {
-            Log.w(TAG, "Shizuku classes not found – add the dependency")
-            null
         } catch (e: Throwable) {
-            Log.e(TAG, "runShell failed for: ${cmd.joinToString(" ")}", e)
-            null
+            Log.e(TAG, "runShell exception cmd=${cmd.joinToString(" ")}", e)
+            Triple(-1, "", e.message ?: "runShell exception")
         }
     }
 
-    /**
-     * Try several command variants; return the first that succeeds (exit 0),
-     * or the last result if all fail. Null only if Shizuku itself is unavailable.
-     */
     fun runShellFirstSuccess(vararg variants: Array<String>): Triple<Int, String, String>? {
+        if (notReadyReason() != null) return null
         var last: Triple<Int, String, String>? = null
         for (cmd in variants) {
             val r = runShell(*cmd) ?: return null
@@ -202,8 +144,7 @@ object ShizukuHelper {
 
     fun getUid(): Int {
         return try {
-            val shizuku = Class.forName("rikka.shizuku.Shizuku")
-            shizuku.getMethod("getUid").invoke(null) as Int
+            Shizuku.getUid()
         } catch (_: Throwable) {
             -1
         }

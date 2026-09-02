@@ -33,7 +33,6 @@ class BluetoothController(private val context: Context) {
                 result.put("error", "BluetoothAdapter unavailable")
                 return result
             }
-
             result.put("enabled", a.isEnabled)
             result.put(
                 "state",
@@ -54,7 +53,6 @@ class BluetoothController(private val context: Context) {
                     "permission_denied"
                 }
             )
-
             val bonded = JSONArray()
             try {
                 a.bondedDevices?.forEach { device ->
@@ -65,11 +63,10 @@ class BluetoothController(private val context: Context) {
                     d.put("type", device.type)
                     bonded.put(d)
                 }
-            } catch (e: SecurityException) {
+            } catch (_: SecurityException) {
                 result.put("bondedError", "BLUETOOTH_CONNECT permission missing")
             }
             result.put("bondedDevices", bonded)
-
         } catch (e: Throwable) {
             result.put("error", e.message ?: "Bluetooth status error")
         }
@@ -78,57 +75,37 @@ class BluetoothController(private val context: Context) {
 
     fun setEnabled(enabled: Boolean): JSONObject {
         val result = JSONObject()
-        try {
-            val svcArg = if (enabled) "enable" else "disable"
+        result.put("shizukuAvailable", ShizukuHelper.isAvailable())
+        result.put("shizukuPermission", ShizukuHelper.isPermissionGranted())
+        result.put("shizukuUid", ShizukuHelper.getUid())
 
-            val r = ShizukuHelper.runShellFirstSuccess(
-                arrayOf("svc", "bluetooth", svcArg),
-                arrayOf("cmd", "bluetooth_manager", "enable"), // enable-only variant on some ROMs
-            )
-
-            // For disable, only svc is reliable; if enable path used wrong cmd when disabling, fix:
-            val shellResult = if (enabled) {
-                r
-            } else {
-                ShizukuHelper.runShell("svc", "bluetooth", "disable")
-            }
-
-            if (shellResult == null) {
-                val a = adapter
-                if (a == null) {
-                    result.put("success", false)
-                    result.put("error", "Shizuku not available and BluetoothAdapter unavailable")
-                    return result
-                }
-                val ok = if (enabled) a.enable() else a.disable()
-                result.put("success", ok)
-                result.put("enabled", enabled)
-                result.put("method", "BluetoothAdapter")
-                if (!ok) {
-                    result.put(
-                        "error",
-                        "BluetoothAdapter enable/disable returned false (need Shizuku running + permission)"
-                    )
-                }
-                return result
-            }
-
-            val (exit, stdout, stderr) = shellResult
-            result.put("success", exit == 0)
-            result.put("exitCode", exit)
-            result.put("stdout", stdout)
-            result.put("stderr", stderr)
-            result.put("enabled", enabled)
-            result.put("method", "shizuku-shell")
-            if (exit != 0) {
-                result.put("error", stderr.ifBlank { "bluetooth toggle failed with code $exit" })
-            }
-        } catch (e: SecurityException) {
+        val notReady = ShizukuHelper.notReadyReason()
+        if (notReady != null) {
             result.put("success", false)
-            result.put("error", "Missing BLUETOOTH_CONNECT / BLUETOOTH_ADMIN permission")
-        } catch (e: Throwable) {
+            result.put("error", notReady)
+            result.put("method", "none")
+            return result
+        }
+
+        val svcArg = if (enabled) "enable" else "disable"
+        val r = ShizukuHelper.runShell("svc", "bluetooth", svcArg)
+
+        if (r == null) {
             result.put("success", false)
-            result.put("error", e.message ?: "Failed to toggle Bluetooth")
+            result.put("error", ShizukuHelper.notReadyReason() ?: "runShell returned null")
+            result.put("method", "none")
+            return result
+        }
+
+        val (exit, stdout, stderr) = r
+        result.put("success", exit == 0)
+        result.put("exitCode", exit)
+        result.put("stdout", stdout)
+        result.put("stderr", stderr)
+        result.put("enabled", enabled)
+        result.put("method", "shizuku-shell svc bluetooth $svcArg")
+        if (exit != 0) {
+            result.put("error", stderr.ifBlank { "svc bluetooth $svcArg failed code $exit" })
         }
         return result
     }
