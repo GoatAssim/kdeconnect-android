@@ -39,7 +39,7 @@ android {
     compileSdk = 37
     defaultConfig {
         applicationId = "org.kde.kdeconnect_tp"
-        minSdk = 23
+        minSdk = 24
         targetSdk = 37
         versionCode = 13513
         versionName = "1.35.13"
