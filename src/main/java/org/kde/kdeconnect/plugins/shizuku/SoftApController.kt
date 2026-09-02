@@ -6,7 +6,6 @@
 package org.kde.kdeconnect.plugins.shizuku
 
 import android.content.Context
-import android.net.wifi.SoftApConfiguration
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.util.Log
@@ -15,15 +14,11 @@ import org.json.JSONObject
 import java.lang.reflect.Method
 
 /**
- * Controls the Wi-Fi SoftAP (hotspot) using a mix of public APIs and Shizuku-privileged
- * hidden APIs. Every public method is exception-safe and returns a JSONObject that
- * either contains the requested data or an "error" field.
+ * SoftAP / hotspot control via reflection so we compile against the public SDK
+ * while still calling the restricted SoftApConfiguration APIs at runtime.
  *
- * Supported operations:
- *  - getConfig / setConfig (SSID, passphrase, band, hidden, max clients, security)
- *  - start / stop
- *  - getConnectedClients
- *  - getBlockedClients / setBlockedClients / banClient / unbanClient
+ * Every public method is exception-safe and returns a JSONObject that either
+ * contains the data or an "error" field.
  */
 class SoftApController(private val context: Context) {
 
@@ -33,7 +28,7 @@ class SoftApController(private val context: Context) {
         get() = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
 
     // ------------------------------------------------------------------
-    // Public API (always returns JSONObject, never throws)
+    // Public API
     // ------------------------------------------------------------------
 
     fun getStatus(): JSONObject {
@@ -45,22 +40,23 @@ class SoftApController(private val context: Context) {
                 return result
             }
 
-            // isWifiApEnabled is hidden on most versions – try reflection first
             var enabled = false
             try {
-                val method: Method = wm.javaClass.getDeclaredMethod("isWifiApEnabled")
-                method.isAccessible = true
-                enabled = method.invoke(wm) as Boolean
+                val m: Method = wm.javaClass.getDeclaredMethod("isWifiApEnabled")
+                m.isAccessible = true
+                enabled = m.invoke(wm) as Boolean
             } catch (_: Throwable) {
-                // fallback – not critical
             }
             result.put("enabled", enabled)
 
-            // SoftApConfiguration (API 30+)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 try {
-                    val config = wm.softApConfiguration
-                    putConfigInto(result, config)
+                    val config = getSoftApConfigurationReflect(wm)
+                    if (config != null) {
+                        putConfigInto(result, config)
+                    } else {
+                        result.put("configError", "Could not read SoftApConfiguration")
+                    }
                 } catch (e: Throwable) {
                     result.put("configError", e.message ?: "Could not read SoftApConfiguration")
                 }
@@ -68,9 +64,7 @@ class SoftApController(private val context: Context) {
                 result.put("configError", "SoftApConfiguration requires Android 11+")
             }
 
-            // Connected clients (best effort)
-            result.put("clients", getConnectedClientsInternal())
-
+            result.put("clients", JSONArray()) // live client list needs SoftApCallback – later
         } catch (e: Throwable) {
             result.put("error", e.message ?: "Hotspot status error")
         }
@@ -88,7 +82,11 @@ class SoftApController(private val context: Context) {
                 result.put("error", "WifiManager unavailable")
                 return result
             }
-            val config = wm.softApConfiguration
+            val config = getSoftApConfigurationReflect(wm)
+            if (config == null) {
+                result.put("error", "Could not read SoftApConfiguration (permission / OEM restriction)")
+                return result
+            }
             putConfigInto(result, config)
         } catch (e: Throwable) {
             result.put("error", e.message ?: "Failed to get SoftApConfiguration")
@@ -97,10 +95,9 @@ class SoftApController(private val context: Context) {
     }
 
     /**
-     * Update hotspot configuration.
-     * Accepted keys in the incoming JSON:
-     *   ssid, passphrase, band (2ghz|5ghz|6ghz|any), hidden (bool),
-     *   maxClients (int), securityType (open|wpa2|wpa3|wpa3_transition)
+     * Accepted keys: ssid, passphrase, band (2ghz|5ghz|6ghz|any),
+     * hidden (bool), maxClients (int), securityType (open|wpa2|wpa3|wpa3_transition),
+     * blockedClients (JSON array of MAC strings)
      */
     fun setConfig(params: JSONObject): JSONObject {
         val result = JSONObject()
@@ -114,64 +111,76 @@ class SoftApController(private val context: Context) {
                 return result
             }
 
-            val current = wm.softApConfiguration
-            val builder = SoftApConfiguration.Builder(current)
+            val current = getSoftApConfigurationReflect(wm)
+            val builderClass = Class.forName("android.net.wifi.SoftApConfiguration\$Builder")
+            val builder = if (current != null) {
+                // SoftApConfiguration.Builder(SoftApConfiguration)
+                builderClass.getConstructor(Class.forName("android.net.wifi.SoftApConfiguration"))
+                    .newInstance(current)
+            } else {
+                builderClass.getConstructor().newInstance()
+            }
 
             if (params.has("ssid")) {
-                builder.setSsid(params.getString("ssid"))
-            }
-            if (params.has("passphrase")) {
-                val pass = params.getString("passphrase")
-                val sec = when (params.optString("securityType", "wpa2").lowercase()) {
-                    "open" -> SoftApConfiguration.SECURITY_TYPE_OPEN
-                    "wpa3" -> SoftApConfiguration.SECURITY_TYPE_WPA3_SAE
-                    "wpa3_transition" -> SoftApConfiguration.SECURITY_TYPE_WPA3_SAE_TRANSITION
-                    else -> SoftApConfiguration.SECURITY_TYPE_WPA2_PSK
-                }
-                if (sec == SoftApConfiguration.SECURITY_TYPE_OPEN) {
-                    builder.setPassphrase(null, SoftApConfiguration.SECURITY_TYPE_OPEN)
-                } else {
-                    builder.setPassphrase(pass, sec)
-                }
-            }
-            if (params.has("hidden")) {
-                builder.setHiddenSsid(params.getBoolean("hidden"))
-            }
-            if (params.has("maxClients") && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                builder.setMaxNumberOfClients(params.getInt("maxClients"))
-            }
-            if (params.has("band")) {
-                val band = when (params.getString("band").lowercase()) {
-                    "2ghz", "2.4ghz" -> SoftApConfiguration.BAND_2GHZ
-                    "5ghz" -> SoftApConfiguration.BAND_5GHZ
-                    "6ghz" -> SoftApConfiguration.BAND_6GHZ
-                    else -> SoftApConfiguration.BAND_2GHZ or SoftApConfiguration.BAND_5GHZ
-                }
-                builder.setBand(band)
+                callBuilder(builder, "setSsid", arrayOf(String::class.java), params.getString("ssid"))
             }
 
-            // Blocked client list
-            if (params.has("blockedClients")) {
+            if (params.has("passphrase") || params.has("securityType")) {
+                val pass = params.optString("passphrase", "")
+                val secName = params.optString("securityType", "wpa2").lowercase()
+                val secType = when (secName) {
+                    "open" -> 0 // SECURITY_TYPE_OPEN
+                    "wpa3" -> 3 // SECURITY_TYPE_WPA3_SAE
+                    "wpa3_transition" -> 4 // SECURITY_TYPE_WPA3_SAE_TRANSITION
+                    else -> 1 // SECURITY_TYPE_WPA2_PSK
+                }
+                if (secType == 0) {
+                    callBuilder(builder, "setPassphrase", arrayOf(String::class.java, Int::class.javaPrimitiveType!!), null, secType)
+                } else {
+                    callBuilder(builder, "setPassphrase", arrayOf(String::class.java, Int::class.javaPrimitiveType!!), pass, secType)
+                }
+            }
+
+            if (params.has("hidden")) {
+                callBuilder(builder, "setHiddenSsid", arrayOf(Boolean::class.javaPrimitiveType!!), params.getBoolean("hidden"))
+            }
+
+            if (params.has("maxClients") && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                callBuilder(builder, "setMaxNumberOfClients", arrayOf(Int::class.javaPrimitiveType!!), params.getInt("maxClients"))
+            }
+
+            if (params.has("band")) {
+                val bandStr = params.getString("band").lowercase()
+                val band = when (bandStr) {
+                    "2ghz", "2.4ghz" -> 1 // BAND_2GHZ
+                    "5ghz" -> 2 // BAND_5GHZ
+                    "6ghz" -> 4 // BAND_6GHZ
+                    else -> 1 or 2 // dual
+                }
+                callBuilder(builder, "setBand", arrayOf(Int::class.javaPrimitiveType!!), band)
+            }
+
+            if (params.has("blockedClients") && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 val arr = params.getJSONArray("blockedClients")
-                val list = mutableListOf<android.net.MacAddress>()
+                val macClass = Class.forName("android.net.MacAddress")
+                val fromString = macClass.getMethod("fromString", String::class.java)
+                val list = java.util.ArrayList<Any>()
                 for (i in 0 until arr.length()) {
                     try {
-                        list.add(android.net.MacAddress.fromString(arr.getString(i)))
+                        list.add(fromString.invoke(null, arr.getString(i))!!)
                     } catch (_: Throwable) {
                     }
                 }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    builder.setBlockedClientList(list)
-                }
+                callBuilder(builder, "setBlockedClientList", arrayOf(java.util.List::class.java), list)
             }
 
-            val newConfig = builder.build()
-            val ok = wm.setSoftApConfiguration(newConfig)
+            val newConfig = builderClass.getMethod("build").invoke(builder)
+            val ok = setSoftApConfigurationReflect(wm, newConfig)
             result.put("success", ok)
-            if (ok) {
+            if (ok && newConfig != null) {
                 putConfigInto(result, newConfig)
-            } else {
-                result.put("error", "setSoftApConfiguration returned false (may need Shizuku privilege on this OEM)")
+            } else if (!ok) {
+                result.put("error", "setSoftApConfiguration returned false (may need Shizuku / system privilege on this OEM)")
             }
         } catch (e: Throwable) {
             result.put("error", e.message ?: "Failed to set SoftApConfiguration")
@@ -187,26 +196,13 @@ class SoftApController(private val context: Context) {
                 result.put("error", "WifiManager unavailable")
                 return result
             }
-
-            // Preferred modern path (API 30+)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                // startTethering is the correct modern way, but requires TetheringManager
-                // and usually the TETHER_PRIVILEGED permission which Shizuku can provide.
-                val started = tryStartTethering()
-                if (started) {
-                    result.put("success", true)
-                    result.put("method", "tethering")
-                    return result
-                }
-            }
-
-            // Fallback reflection (older / some OEMs)
             try {
-                val method = wm.javaClass.getMethod("startSoftAp", android.net.wifi.WifiConfiguration::class.java)
-                val ok = method.invoke(wm, null as android.net.wifi.WifiConfiguration?) as Boolean
+                val method = wm.javaClass.getMethod("startSoftAp", Class.forName("android.net.wifi.WifiConfiguration"))
+                val ok = method.invoke(wm, null as Any?) as Boolean
                 result.put("success", ok)
                 result.put("method", "startSoftAp")
             } catch (e: Throwable) {
+                // Alternative: startTethering via ConnectivityManager / TetheringManager reflection
                 result.put("error", "Could not start SoftAP: ${e.message}")
             }
         } catch (e: Throwable) {
@@ -222,16 +218,6 @@ class SoftApController(private val context: Context) {
                 result.put("error", "WifiManager unavailable")
                 return result
             }
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                val stopped = tryStopTethering()
-                if (stopped) {
-                    result.put("success", true)
-                    result.put("method", "tethering")
-                    return result
-                }
-            }
-
             try {
                 val method = wm.javaClass.getMethod("stopSoftAp")
                 val ok = method.invoke(wm) as Boolean
@@ -248,11 +234,8 @@ class SoftApController(private val context: Context) {
 
     fun getConnectedClients(): JSONObject {
         val result = JSONObject()
-        try {
-            result.put("clients", getConnectedClientsInternal())
-        } catch (e: Throwable) {
-            result.put("error", e.message ?: "Failed to list clients")
-        }
+        result.put("clients", JSONArray())
+        result.put("note", "Live client list requires SoftApCallback (next iteration)")
         return result
     }
 
@@ -263,20 +246,19 @@ class SoftApController(private val context: Context) {
                 result.put("error", "Client blocking requires Android 12+")
                 return result
             }
-            val wm = wifiManager ?: run {
-                result.put("error", "WifiManager unavailable")
-                return result
+            val current = getConfig()
+            if (current.has("error")) return current
+
+            val blocked = mutableListOf<String>()
+            val arr = current.optJSONArray("blockedClients")
+            if (arr != null) {
+                for (i in 0 until arr.length()) blocked.add(arr.getString(i))
             }
-            val current = wm.softApConfiguration
-            val blocked = current.blockedClientList.toMutableList()
-            val macAddr = android.net.MacAddress.fromString(mac)
-            if (!blocked.contains(macAddr)) {
-                blocked.add(macAddr)
-            }
-            val builder = SoftApConfiguration.Builder(current).setBlockedClientList(blocked)
-            val ok = wm.setSoftApConfiguration(builder.build())
-            result.put("success", ok)
-            result.put("blockedClients", JSONArray(blocked.map { it.toString() }))
+            if (!blocked.contains(mac)) blocked.add(mac)
+
+            val params = JSONObject()
+            params.put("blockedClients", JSONArray(blocked))
+            return setConfig(params)
         } catch (e: Throwable) {
             result.put("error", e.message ?: "banClient failed")
         }
@@ -290,18 +272,21 @@ class SoftApController(private val context: Context) {
                 result.put("error", "Client blocking requires Android 12+")
                 return result
             }
-            val wm = wifiManager ?: run {
-                result.put("error", "WifiManager unavailable")
-                return result
+            val current = getConfig()
+            if (current.has("error")) return current
+
+            val blocked = mutableListOf<String>()
+            val arr = current.optJSONArray("blockedClients")
+            if (arr != null) {
+                for (i in 0 until arr.length()) {
+                    val m = arr.getString(i)
+                    if (m != mac) blocked.add(m)
+                }
             }
-            val current = wm.softApConfiguration
-            val blocked = current.blockedClientList.toMutableList()
-            val macAddr = android.net.MacAddress.fromString(mac)
-            blocked.remove(macAddr)
-            val builder = SoftApConfiguration.Builder(current).setBlockedClientList(blocked)
-            val ok = wm.setSoftApConfiguration(builder.build())
-            result.put("success", ok)
-            result.put("blockedClients", JSONArray(blocked.map { it.toString() }))
+
+            val params = JSONObject()
+            params.put("blockedClients", JSONArray(blocked))
+            return setConfig(params)
         } catch (e: Throwable) {
             result.put("error", e.message ?: "unbanClient failed")
         }
@@ -309,57 +294,97 @@ class SoftApController(private val context: Context) {
     }
 
     // ------------------------------------------------------------------
-    // Internal helpers
+    // Reflection helpers
     // ------------------------------------------------------------------
 
-    private fun putConfigInto(target: JSONObject, config: SoftApConfiguration) {
-        target.put("ssid", config.ssid ?: "")
-        target.put("hidden", config.isHiddenSsid)
-        target.put("securityType", when (config.securityType) {
-            SoftApConfiguration.SECURITY_TYPE_OPEN -> "open"
-            SoftApConfiguration.SECURITY_TYPE_WPA2_PSK -> "wpa2"
-            SoftApConfiguration.SECURITY_TYPE_WPA3_SAE -> "wpa3"
-            SoftApConfiguration.SECURITY_TYPE_WPA3_SAE_TRANSITION -> "wpa3_transition"
-            else -> "unknown"
-        })
-        // Passphrase is not readable for security reasons on most builds
-        target.put("passphraseReadable", false)
-
-        val band = config.band
-        val bands = mutableListOf<String>()
-        if (band and SoftApConfiguration.BAND_2GHZ != 0) bands.add("2ghz")
-        if (band and SoftApConfiguration.BAND_5GHZ != 0) bands.add("5ghz")
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && band and SoftApConfiguration.BAND_6GHZ != 0) {
-            bands.add("6ghz")
-        }
-        target.put("band", bands.joinToString(","))
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            target.put("maxClients", config.maxNumberOfClients)
-            val blocked = JSONArray()
-            config.blockedClientList.forEach { blocked.put(it.toString()) }
-            target.put("blockedClients", blocked)
+    private fun getSoftApConfigurationReflect(wm: WifiManager): Any? {
+        return try {
+            val m = wm.javaClass.getMethod("getSoftApConfiguration")
+            m.invoke(wm)
+        } catch (e: Throwable) {
+            Log.w(TAG, "getSoftApConfiguration failed", e)
+            null
         }
     }
 
-    private fun getConnectedClientsInternal(): JSONArray {
-        val arr = JSONArray()
-        // Connected client list is not exposed via a stable public API.
-        // Many OEMs / AOSP builds expose it only through privileged callbacks
-        // (SoftApCallback.onConnectedClientsChanged). For a first version we return
-        // an empty list and document the limitation. Future improvement: register
-        // a SoftApCallback via Shizuku.
-        return arr
+    private fun setSoftApConfigurationReflect(wm: WifiManager, config: Any?): Boolean {
+        return try {
+            val m = wm.javaClass.getMethod(
+                "setSoftApConfiguration",
+                Class.forName("android.net.wifi.SoftApConfiguration")
+            )
+            m.invoke(wm, config) as Boolean
+        } catch (e: Throwable) {
+            Log.w(TAG, "setSoftApConfiguration failed", e)
+            false
+        }
     }
 
-    private fun tryStartTethering(): Boolean {
-        // Placeholder – full ITetheringConnector path via Shizuku will be added
-        // in the next iteration once we have the exact AIDL stubs.
-        // For now return false so the reflection fallback is used.
-        return false
+    private fun callBuilder(builder: Any, method: String, types: Array<Class<*>>, vararg args: Any?) {
+        val m = builder.javaClass.getMethod(method, *types)
+        m.invoke(builder, *args)
     }
 
-    private fun tryStopTethering(): Boolean {
-        return false
+    private fun putConfigInto(target: JSONObject, config: Any) {
+        try {
+            val c = config.javaClass
+            fun invokeStr(name: String): String {
+                return try {
+                    (c.getMethod(name).invoke(config) as? String) ?: ""
+                } catch (_: Throwable) {
+                    ""
+                }
+            }
+            fun invokeBool(name: String): Boolean {
+                return try {
+                    c.getMethod(name).invoke(config) as Boolean
+                } catch (_: Throwable) {
+                    false
+                }
+            }
+            fun invokeInt(name: String): Int {
+                return try {
+                    c.getMethod(name).invoke(config) as Int
+                } catch (_: Throwable) {
+                    -1
+                }
+            }
+
+            target.put("ssid", invokeStr("getSsid"))
+            target.put("hidden", invokeBool("isHiddenSsid"))
+            val sec = invokeInt("getSecurityType")
+            target.put(
+                "securityType", when (sec) {
+                    0 -> "open"
+                    1 -> "wpa2"
+                    3 -> "wpa3"
+                    4 -> "wpa3_transition"
+                    else -> "unknown"
+                }
+            )
+            target.put("passphraseReadable", false)
+
+            val band = invokeInt("getBand")
+            val bands = mutableListOf<String>()
+            if (band and 1 != 0) bands.add("2ghz")
+            if (band and 2 != 0) bands.add("5ghz")
+            if (band and 4 != 0) bands.add("6ghz")
+            target.put("band", bands.joinToString(","))
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                target.put("maxClients", invokeInt("getMaxNumberOfClients"))
+                try {
+                    @Suppress("UNCHECKED_CAST")
+                    val list = c.getMethod("getBlockedClientList").invoke(config) as? List<*>
+                    val blocked = JSONArray()
+                    list?.forEach { blocked.put(it.toString()) }
+                    target.put("blockedClients", blocked)
+                } catch (_: Throwable) {
+                    target.put("blockedClients", JSONArray())
+                }
+            }
+        } catch (e: Throwable) {
+            target.put("configParseError", e.message ?: "parse failed")
+        }
     }
 }

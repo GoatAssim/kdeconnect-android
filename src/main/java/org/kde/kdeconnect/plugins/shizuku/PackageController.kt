@@ -7,19 +7,20 @@ package org.kde.kdeconnect.plugins.shizuku
 
 import android.content.Context
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.Build
+import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
-import rikka.shizuku.Shizuku
 import java.io.File
 
 /**
- * Privileged package management via Shizuku.
- * Supports listing, install (single APK path), uninstall.
- * Full split-APK / session installer can be added later.
+ * Package management. Uses normal PackageManager for listing.
+ * Install/uninstall go through Shizuku when available (via reflection so we
+ * still compile if the Shizuku dependency is missing).
  */
 class PackageController(private val context: Context) {
+
+    private val TAG = "PackageController"
 
     fun listPackages(userOnly: Boolean = true): JSONObject {
         val result = JSONObject()
@@ -35,14 +36,18 @@ class PackageController(private val context: Context) {
 
             val arr = JSONArray()
             packages.forEach { pi ->
-                if (userOnly && (pi.applicationInfo?.flags?.and(android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0)) {
+                val appInfo = pi.applicationInfo
+                if (userOnly && appInfo != null && (appInfo.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0) {
                     return@forEach
                 }
                 val obj = JSONObject()
                 obj.put("packageName", pi.packageName)
                 obj.put("versionName", pi.versionName ?: "")
-                obj.put("versionCode", if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) pi.longVersionCode else pi.versionCode.toLong())
-                obj.put("label", pi.applicationInfo?.loadLabel(pm)?.toString() ?: "")
+                obj.put(
+                    "versionCode",
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) pi.longVersionCode else @Suppress("DEPRECATION") pi.versionCode.toLong()
+                )
+                obj.put("label", appInfo?.loadLabel(pm)?.toString() ?: "")
                 arr.put(obj)
             }
             result.put("packages", arr)
@@ -53,75 +58,87 @@ class PackageController(private val context: Context) {
         return result
     }
 
-    /**
-     * Install a single APK from a local path.
-     * Requires Shizuku permission. Uses the shell identity.
-     */
     fun installApk(path: String): JSONObject {
         val result = JSONObject()
-        val r = ShizukuHelper.runPrivileged {
-            // Simple approach: use `pm install` via Shizuku's shell-like execution
-            // More robust session-based installer can be added later.
+        try {
             val file = File(path)
             if (!file.exists()) {
-                throw IllegalArgumentException("APK file does not exist: $path")
+                result.put("error", "APK file does not exist: $path")
+                return result
             }
 
-            // Use Shizuku's newProcess / shell execution if available, otherwise reflection
-            // For v13+ the recommended way is still the PackageInstaller session with
-            // the Shizuku-wrapped IPackageManager, but the simplest reliable method is:
-            val process = Shizuku.newProcess(arrayOf("pm", "install", "-r", "-d", path), null, null)
-            val exit = process.waitFor()
-            val stdout = process.inputStream.bufferedReader().readText()
-            val stderr = process.errorStream.bufferedReader().readText()
-            Triple(exit, stdout, stderr)
-        }
-
-        return when {
-            r.isSuccess -> {
-                val (exit, stdout, stderr) = r.getOrThrow()
-                result.put("success", exit == 0)
-                result.put("exitCode", exit)
-                result.put("stdout", stdout)
-                result.put("stderr", stderr)
-                if (exit != 0) {
-                    result.put("error", stderr.ifEmpty { "pm install failed with code $exit" })
-                }
-                result
+            val r = runPmViaShizuku(arrayOf("pm", "install", "-r", "-d", path))
+            if (r == null) {
+                result.put("error", "Shizuku not available – cannot install")
+                return result
             }
-            else -> {
-                result.put("error", r.exceptionOrNull()?.message ?: "install failed")
-                result
+            val (exit, stdout, stderr) = r
+            result.put("success", exit == 0)
+            result.put("exitCode", exit)
+            result.put("stdout", stdout)
+            result.put("stderr", stderr)
+            if (exit != 0) {
+                result.put("error", if (stderr.isNotEmpty()) stderr else "pm install failed with code $exit")
             }
+        } catch (e: Throwable) {
+            result.put("error", e.message ?: "install failed")
+            Log.e(TAG, "installApk failed", e)
         }
+        return result
     }
 
     fun uninstall(packageName: String): JSONObject {
         val result = JSONObject()
-        val r = ShizukuHelper.runPrivileged {
-            val process = Shizuku.newProcess(arrayOf("pm", "uninstall", packageName), null, null)
+        try {
+            val r = runPmViaShizuku(arrayOf("pm", "uninstall", packageName))
+            if (r == null) {
+                result.put("error", "Shizuku not available – cannot uninstall")
+                return result
+            }
+            val (exit, stdout, stderr) = r
+            result.put("success", exit == 0)
+            result.put("exitCode", exit)
+            result.put("stdout", stdout)
+            result.put("stderr", stderr)
+            if (exit != 0) {
+                result.put("error", if (stderr.isNotEmpty()) stderr else "pm uninstall failed with code $exit")
+            }
+        } catch (e: Throwable) {
+            result.put("error", e.message ?: "uninstall failed")
+            Log.e(TAG, "uninstall failed", e)
+        }
+        return result
+    }
+
+    /**
+     * Runs a command via Shizuku.newProcess using reflection so this file
+     * compiles even if the Shizuku library is not on the classpath yet.
+     * Returns (exitCode, stdout, stderr) or null if Shizuku is unavailable.
+     */
+    private fun runPmViaShizuku(cmd: Array<String>): Triple<Int, String, String>? {
+        return try {
+            if (!ShizukuHelper.isAvailable() || !ShizukuHelper.isPermissionGranted()) {
+                return null
+            }
+            // rikka.shizuku.Shizuku.newProcess(String[], String[], String)
+            val shizukuClass = Class.forName("rikka.shizuku.Shizuku")
+            val newProcess = shizukuClass.getMethod(
+                "newProcess",
+                Array<String>::class.java,
+                Array<String>::class.java,
+                String::class.java
+            )
+            val process = newProcess.invoke(null, cmd, null, null) as Process
             val exit = process.waitFor()
             val stdout = process.inputStream.bufferedReader().readText()
             val stderr = process.errorStream.bufferedReader().readText()
             Triple(exit, stdout, stderr)
-        }
-
-        return when {
-            r.isSuccess -> {
-                val (exit, stdout, stderr) = r.getOrThrow()
-                result.put("success", exit == 0)
-                result.put("exitCode", exit)
-                result.put("stdout", stdout)
-                result.put("stderr", stderr)
-                if (exit != 0) {
-                    result.put("error", stderr.ifEmpty { "pm uninstall failed with code $exit" })
-                }
-                result
-            }
-            else -> {
-                result.put("error", r.exceptionOrNull()?.message ?: "uninstall failed")
-                result
-            }
+        } catch (e: ClassNotFoundException) {
+            Log.w(TAG, "Shizuku classes not found – add the dependency")
+            null
+        } catch (e: Throwable) {
+            Log.e(TAG, "runPmViaShizuku failed", e)
+            null
         }
     }
 }

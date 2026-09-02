@@ -326,6 +326,8 @@ dependencies {
     // For device controls
     implementation(libs.reactive.streams)
     implementation(libs.rxjava)
+    implementation(libs.shizuku.api)
+    implementation(libs.shizuku.provider)
 }
 
 licenseReport {
