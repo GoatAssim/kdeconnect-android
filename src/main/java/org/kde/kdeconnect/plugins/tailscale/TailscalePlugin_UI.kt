@@ -6,6 +6,7 @@
 package org.kde.kdeconnect.plugins.tailscale
 
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
 import android.preference.PreferenceManager
 import android.util.Log
@@ -15,17 +16,6 @@ import org.kde.kdeconnect.plugins.Plugin
 import org.kde.kdeconnect.plugins.PluginFactory.LoadablePlugin
 import org.kde.kdeconnect_tp.R
 
-/**
- * TailscalePlugin (Android)
- *
- * - Stores the Tailscale IP of the paired desktop.
- * - Automatically adds that IP to the same custom-device list that
- *   "Add devices by IP" uses, so the phone will keep trying the PC
- *   over Tailscale without re-pairing.
- * - Also accepts the desktop announcing its own Tailscale IP.
- *
- * Packet type: kdeconnect.tailscale
- */
 @LoadablePlugin
 class TailscalePlugin : Plugin() {
 
@@ -42,10 +32,20 @@ class TailscalePlugin : Plugin() {
 
     override fun hasSettings(): Boolean = true
 
+    override fun getUiButtons(): List<PluginUiButton> = listOf(
+        PluginUiButton(
+            context.getString(R.string.tailscale_button),
+            android.R.drawable.ic_menu_share,
+        ) { parentActivity ->
+            val intent = Intent(parentActivity, TailscaleActivity::class.java)
+            intent.putExtra("deviceId", device.deviceId)
+            parentActivity.startActivity(intent)
+        },
+    )
+
     override fun onCreate(): Boolean {
         val remoteIp = getRemoteTailscaleIp()
         if (remoteIp.isNotEmpty()) {
-            // Make sure it is still present in the global custom-device list
             addToCustomDevices(remoteIp)
             sendRemoteIpAnnouncement(remoteIp)
         }
@@ -62,26 +62,19 @@ class TailscalePlugin : Plugin() {
 
         try {
             when (action) {
-                "status" -> {
-                    reply["body"] = getLocalStatus().toString()
-                }
+                "status" -> reply["body"] = getLocalStatus().toString()
                 "getRemoteIp" -> {
-                    val obj = JSONObject()
-                    obj.put("remoteIp", getRemoteTailscaleIp())
-                    obj.put("selfIp", getSelfTailscaleIp())
-                    reply["body"] = obj.toString()
+                    reply["body"] = JSONObject()
+                        .put("remoteIp", getRemoteTailscaleIp())
+                        .put("selfIp", getSelfTailscaleIp())
+                        .toString()
                 }
                 "setRemoteIp" -> {
                     val ip = np.getString("ip").trim()
                     if (isValidTailscaleIp(ip) || ip.isEmpty()) {
                         setRemoteTailscaleIp(ip)
-                        if (ip.isNotEmpty()) {
-                            addToCustomDevices(ip)
-                        }
-                        reply["body"] = JSONObject()
-                            .put("success", true)
-                            .put("remoteIp", ip)
-                            .toString()
+                        if (ip.isNotEmpty()) addToCustomDevices(ip)
+                        reply["body"] = JSONObject().put("success", true).put("remoteIp", ip).toString()
                         if (ip.isNotEmpty()) sendRemoteIpAnnouncement(ip)
                     } else {
                         reply["error"] = "Invalid Tailscale IP (expected 100.x.x.x)"
@@ -91,22 +84,18 @@ class TailscalePlugin : Plugin() {
                     val ip = np.getString("ip").trim()
                     if (isValidTailscaleIp(ip) || ip.isEmpty()) {
                         setSelfTailscaleIp(ip)
-                        reply["body"] = JSONObject()
-                            .put("success", true)
-                            .put("selfIp", ip)
-                            .toString()
+                        reply["body"] = JSONObject().put("success", true).put("selfIp", ip).toString()
                     } else {
                         reply["error"] = "Invalid Tailscale IP"
                     }
                 }
-                "up" -> {
-                    reply["body"] = controlTailscale(true).toString()
-                }
-                "down" -> {
-                    reply["body"] = controlTailscale(false).toString()
+                "up", "down" -> {
+                    reply["body"] = JSONObject()
+                        .put("success", false)
+                        .put("message", "Use the Tailscale app or Quick Settings tile on the phone")
+                        .toString()
                 }
                 "selfIp" -> {
-                    // Desktop is telling us its Tailscale IP → store + auto-add
                     val ip = np.getString("ip").trim()
                     if (isValidTailscaleIp(ip)) {
                         setRemoteTailscaleIp(ip)
@@ -116,7 +105,7 @@ class TailscalePlugin : Plugin() {
                             .put("addedToCustomDevices", true)
                             .put("remoteIp", ip)
                             .toString()
-                        Log.i(TAG, "Auto-added desktop Tailscale IP to custom devices: $ip")
+                        Log.i(TAG, "Auto-added desktop Tailscale IP: $ip")
                     } else {
                         reply["error"] = "Invalid IP received"
                     }
@@ -132,54 +121,31 @@ class TailscalePlugin : Plugin() {
         return true
     }
 
-    // ------------------------------------------------------------------
-    // Persistence (per-device)
-    // ------------------------------------------------------------------
-
     fun getRemoteTailscaleIp(): String = prefs.getString(KEY_REMOTE_IP, "") ?: ""
     fun setRemoteTailscaleIp(ip: String) = prefs.edit().putString(KEY_REMOTE_IP, ip).apply()
-
     fun getSelfTailscaleIp(): String = prefs.getString(KEY_SELF_IP, "") ?: ""
     fun setSelfTailscaleIp(ip: String) = prefs.edit().putString(KEY_SELF_IP, ip).apply()
 
-    // ------------------------------------------------------------------
-    // Auto-add to the same list used by "Add devices by IP"
-    // ------------------------------------------------------------------
-
-    /**
-     * Writes the IP into the preference that CustomDevicesActivity / LanLinkProvider
-     * already read. This is the Android equivalent of desktop's customDevices.
-     */
     private fun addToCustomDevices(ip: String) {
         if (ip.isEmpty()) return
-
         try {
             val defaultPrefs = PreferenceManager.getDefaultSharedPreferences(context)
-            val key = "device_list_preference"          // same key CustomDevicesActivity uses
+            val key = "device_list_preference"
             val current = defaultPrefs.getString(key, "") ?: ""
-
             val list = if (current.isEmpty()) {
                 mutableListOf()
             } else {
                 current.split(",").map { it.trim() }.filter { it.isNotEmpty() }.toMutableList()
             }
-
             if (!list.contains(ip)) {
                 list.add(ip)
-                val serialized = list.joinToString(",")
-                defaultPrefs.edit().putString(key, serialized).apply()
-                Log.i(TAG, "Added $ip to Android custom device list → $serialized")
-            } else {
-                Log.d(TAG, "$ip already present in custom device list")
+                defaultPrefs.edit().putString(key, list.joinToString(",")).apply()
+                Log.i(TAG, "Added $ip to Android custom device list")
             }
         } catch (e: Throwable) {
             Log.e(TAG, "Failed to add $ip to custom devices", e)
         }
     }
-
-    // ------------------------------------------------------------------
-    // Helpers
-    // ------------------------------------------------------------------
 
     private fun isValidTailscaleIp(ip: String): Boolean {
         if (!ip.matches(Regex("""^\d{1,3}(\.\d{1,3}){3}$"""))) return false
@@ -190,42 +156,9 @@ class TailscalePlugin : Plugin() {
     }
 
     private fun getLocalStatus(): JSONObject {
-        val obj = JSONObject()
-        obj.put("remoteIp", getRemoteTailscaleIp())
-        obj.put("selfIp", getSelfTailscaleIp())
-        obj.put("tailscaleInstalled", isTailscaleInstalled())
-        obj.put("inCustomDevices", isInCustomDevices(getRemoteTailscaleIp()))
-        return obj
-    }
-
-    private fun isInCustomDevices(ip: String): Boolean {
-        if (ip.isEmpty()) return false
-        val current = PreferenceManager.getDefaultSharedPreferences(context)
-            .getString("device_list_preference", "") ?: ""
-        return current.split(",").map { it.trim() }.contains(ip)
-    }
-
-    private fun isTailscaleInstalled(): Boolean {
-        return try {
-            context.packageManager.getPackageInfo("com.tailscale.ipn", 0)
-            true
-        } catch (_: Throwable) {
-            false
-        }
-    }
-
-    private fun controlTailscale(up: Boolean): JSONObject {
-        val result = JSONObject()
-        result.put("success", false)
-        result.put(
-            "message",
-            if (up)
-                "Please enable Tailscale from the Tailscale app or Quick Settings tile"
-            else
-                "Please disable Tailscale from the Tailscale app or Quick Settings tile"
-        )
-        result.put("installed", isTailscaleInstalled())
-        return result
+        return JSONObject()
+            .put("remoteIp", getRemoteTailscaleIp())
+            .put("selfIp", getSelfTailscaleIp())
     }
 
     private fun sendRemoteIpAnnouncement(ip: String) {

@@ -5,6 +5,7 @@
  */
 package org.kde.kdeconnect.plugins.shizuku
 
+import android.content.Intent
 import android.util.Log
 import org.json.JSONObject
 import org.kde.kdeconnect.NetworkPacket
@@ -13,32 +14,9 @@ import org.kde.kdeconnect.plugins.PluginFactory.LoadablePlugin
 import org.kde.kdeconnect_tp.R
 
 /**
- * ShizukuPlugin – gives the paired desktop privileged access to the phone
- * via Shizuku (ADB/shell identity).
+ * ShizukuPlugin – privileged phone control + UI button on device page.
  *
  * Packet type: kdeconnect.shizuku
- *
- * Incoming body actions:
- *   status          – overall Shizuku + quick summary
- *   battery         – detailed battery
- *   wifi            – Wi-Fi status
- *   wifi.scan       – scan networks
- *   wifi.enable / wifi.disable
- *   bluetooth       – Bluetooth status
- *   bluetooth.enable / bluetooth.disable
- *   hotspot         – full SoftAP status + config
- *   hotspot.getConfig
- *   hotspot.setConfig   (body contains ssid, passphrase, band, …)
- *   hotspot.start / hotspot.stop
- *   hotspot.clients
- *   hotspot.ban     (mac=…)
- *   hotspot.unban   (mac=…)
- *   packages.list
- *   packages.install (path=…)
- *   packages.uninstall (packageName=…)
- *
- * Every reply is a NetworkPacket of type kdeconnect.shizuku with
- * an "action" field mirroring the request and either the data or an "error" string.
  */
 @LoadablePlugin
 class ShizukuPlugin : Plugin() {
@@ -56,6 +34,17 @@ class ShizukuPlugin : Plugin() {
         get() = context.getString(R.string.pref_plugin_shizuku_desc)
 
     override val isEnabledByDefault: Boolean = false
+
+    override fun getUiButtons(): List<PluginUiButton> = listOf(
+        PluginUiButton(
+            context.getString(R.string.shizuku_button),
+            android.R.drawable.ic_menu_manage,
+        ) { parentActivity ->
+            val intent = Intent(parentActivity, ShizukuActivity::class.java)
+            intent.putExtra("deviceId", device.deviceId)
+            parentActivity.startActivity(intent)
+        },
+    )
 
     override fun onCreate(): Boolean {
         ShizukuHelper.init(context)
@@ -79,7 +68,7 @@ class ShizukuPlugin : Plugin() {
 
         val reply = NetworkPacket(PACKET_TYPE)
         reply["action"] = action
-        reply["requestId"] = np.getString("requestId") // optional correlation
+        reply["requestId"] = np.getString("requestId")
 
         try {
             when (action) {
@@ -92,18 +81,14 @@ class ShizukuPlugin : Plugin() {
                     status.put("isShell", ShizukuHelper.isShell())
                     reply["body"] = status.toString()
                 }
-
                 "battery" -> reply["body"] = battery.getStatus().toString()
-
                 "wifi" -> reply["body"] = wifi.getStatus().toString()
                 "wifi.scan" -> reply["body"] = wifi.scanNetworks().toString()
                 "wifi.enable" -> reply["body"] = wifi.setEnabled(true).toString()
                 "wifi.disable" -> reply["body"] = wifi.setEnabled(false).toString()
-
                 "bluetooth" -> reply["body"] = bluetooth.getStatus().toString()
                 "bluetooth.enable" -> reply["body"] = bluetooth.setEnabled(true).toString()
                 "bluetooth.disable" -> reply["body"] = bluetooth.setEnabled(false).toString()
-
                 "hotspot" -> reply["body"] = softAp.getStatus().toString()
                 "hotspot.getConfig" -> reply["body"] = softAp.getConfig().toString()
                 "hotspot.setConfig" -> {
@@ -117,36 +102,19 @@ class ShizukuPlugin : Plugin() {
                 "hotspot.start" -> reply["body"] = softAp.start().toString()
                 "hotspot.stop" -> reply["body"] = softAp.stop().toString()
                 "hotspot.clients" -> reply["body"] = softAp.getConnectedClients().toString()
-                "hotspot.ban" -> {
-                    val mac = np.getString("mac")
-                    reply["body"] = softAp.banClient(mac).toString()
-                }
-                "hotspot.unban" -> {
-                    val mac = np.getString("mac")
-                    reply["body"] = softAp.unbanClient(mac).toString()
-                }
-
+                "hotspot.ban" -> reply["body"] = softAp.banClient(np.getString("mac")).toString()
+                "hotspot.unban" -> reply["body"] = softAp.unbanClient(np.getString("mac")).toString()
                 "packages.list" -> {
                     val userOnly = np.getBoolean("userOnly", true)
                     reply["body"] = packages.listPackages(userOnly).toString()
                 }
-                "packages.install" -> {
-                    val path = np.getString("path")
-                    reply["body"] = packages.installApk(path).toString()
-                }
-                "packages.uninstall" -> {
-                    val pkg = np.getString("packageName")
-                    reply["body"] = packages.uninstall(pkg).toString()
-                }
-
+                "packages.install" -> reply["body"] = packages.installApk(np.getString("path")).toString()
+                "packages.uninstall" -> reply["body"] = packages.uninstall(np.getString("packageName")).toString()
                 "requestPermission" -> {
                     ShizukuHelper.requestPermission()
                     reply["body"] = JSONObject().put("requested", true).toString()
                 }
-
-                else -> {
-                    reply["error"] = "Unknown action: $action"
-                }
+                else -> reply["error"] = "Unknown action: $action"
             }
         } catch (e: Throwable) {
             Log.e(TAG, "Error handling action $action", e)
