@@ -506,60 +506,58 @@ private fun onCallStateChanged(state: Int, number: String?, subId: Int) {
             o
         }
     }
+private fun dial(number: String, subscriptionId: Int): JSONObject {
+    val o = JSONObject()
+    if (number.isBlank()) {
+        o.put("success", false)
+        o.put("error", "empty number")
+        return o
+    }
+    if (ContextCompat.checkSelfPermission(context, Manifest.permission.CALL_PHONE)
+        != PackageManager.PERMISSION_GRANTED
+    ) {
+        o.put("success", false)
+        o.put("error", "CALL_PHONE permission missing")
+        return o
+    }
 
-    private fun dial(number: String, subscriptionId: Int): JSONObject {
-        val o = JSONObject()
-        if (number.isBlank()) {
-            o.put("success", false)
-            o.put("error", "empty number")
-            return o
-        }
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.CALL_PHONE)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
-            o.put("success", false)
-            o.put("error", "CALL_PHONE permission missing")
-            return o
-        }
-        return try {
-            val uri = Uri.fromParts("tel", number, null)
-            val telecom = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
+    return try {
+        val uri = Uri.fromParts("tel", number, null)
+        val telecom = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
+        val extras = Bundle()
 
-            if (subscriptionId > 0 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                val handle = phoneAccountHandleForSubId(subscriptionId)
-                if (handle != null) {
-                    val extras = Bundle()
-                    extras.putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, handle)
-                    telecom.placeCall(uri, extras)
-                    o.put("success", true)
-                    o.put("number", number)
-                    o.put("subscriptionId", subscriptionId)
-                    o.put("method", "placeCall+sim")
-                    return o
-                }
+        if (subscriptionId > 0 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val handle = phoneAccountHandleForSubId(subscriptionId)
+            if (handle != null) {
+                extras.putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, handle)
             }
+        }
 
-            // Fallback: default SIM / dialer
-            val intent = Intent(Intent.ACTION_CALL, uri)
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            if (subscriptionId > 0 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                val handle = phoneAccountHandleForSubId(subscriptionId)
-                if (handle != null) {
-                    intent.putExtra(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, handle)
-                }
-            }
-            context.startActivity(intent)
+        // placeCall works from background; startActivity(ACTION_CALL) often does NOT
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            telecom.placeCall(uri, extras)
             o.put("success", true)
             o.put("number", number)
             o.put("subscriptionId", subscriptionId)
-            o.put("method", "ACTION_CALL")
-            o
-        } catch (e: Throwable) {
-            o.put("success", false)
-            o.put("error", e.message ?: "dial failed")
-            o
+            o.put("method", "placeCall")
+            return o
         }
+
+        val intent = Intent(Intent.ACTION_CALL, uri)
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(intent)
+        o.put("success", true)
+        o.put("number", number)
+        o.put("subscriptionId", subscriptionId)
+        o.put("method", "ACTION_CALL")
+        o
+    } catch (e: Throwable) {
+        Log.e(TAG, "dial failed", e)
+        o.put("success", false)
+        o.put("error", e.message ?: "dial failed")
+        o
     }
+}
 
     private fun phoneAccountHandleForSubId(subId: Int): PhoneAccountHandle? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return null
