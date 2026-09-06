@@ -22,6 +22,7 @@ import android.telephony.TelephonyCallback
 import android.telephony.TelephonyManager
 import android.util.Log
 import androidx.core.content.ContextCompat
+import java.util.Locale
 import org.json.JSONArray
 import org.json.JSONObject
 import org.kde.kdeconnect.NetworkPacket
@@ -357,6 +358,36 @@ class CallBridgePlugin : Plugin() {
         return o
     }
 
+    /**
+     * Turns a raw contact's (account_type, account_name) into a stable "source" key the PC
+     * side can group/filter on, plus a human-readable label. Kept generic on purpose: any
+     * account type we don't specifically recognize still gets its own key/label derived from
+     * whatever Android reports, rather than being lumped into one "Other" bucket, so filtering
+     * works correctly for account types this code has never heard of.
+     */
+    private fun classifyContactSource(accountType: String?, accountName: String?): Pair<String, String> {
+        if (accountType.isNullOrBlank()) {
+            // No raw-contact account at all == stored locally on the device.
+            return "phone" to "Phone"
+        }
+        val type = accountType.lowercase(Locale.ROOT)
+        return when {
+            type.contains("sim") -> "sim" to "SIM"
+            type == "com.google" || type.contains("google") -> "google" to "Google"
+            type.contains("exchange") || type.contains("eas") -> "exchange" to "Exchange"
+            type.contains("whatsapp") -> "whatsapp" to "WhatsApp"
+            type.contains("telegram") -> "telegram" to "Telegram"
+            type.contains("skype") -> "skype" to "Skype"
+            type.contains("samsung") || type.contains("osp") -> "samsung" to "Samsung account"
+            else -> {
+                // Unknown account type: key on the raw type so contacts from the same
+                // account still group together, label with whatever's most readable.
+                val label = accountName?.takeIf { it.isNotBlank() } ?: accountType
+                accountType to label
+            }
+        }
+    }
+
     private fun listContacts(query: String): JSONObject {
         val o = JSONObject()
         val arr = JSONArray()
@@ -368,9 +399,13 @@ class CallBridgePlugin : Plugin() {
             return o
         }
         try {
+            // ACCOUNT_TYPE/ACCOUNT_NAME live on RawContacts, but the Phone Data view is
+            // joined against raw_contacts so they can be requested directly here.
             val projection = arrayOf(
                 ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
-                ContactsContract.CommonDataKinds.Phone.NUMBER
+                ContactsContract.CommonDataKinds.Phone.NUMBER,
+                ContactsContract.RawContacts.ACCOUNT_TYPE,
+                ContactsContract.RawContacts.ACCOUNT_NAME
             )
             val selection: String?
             val args: Array<String>?
@@ -394,7 +429,18 @@ class CallBridgePlugin : Plugin() {
                     val name = cursor.getString(0) ?: ""
                     val number = cursor.getString(1) ?: ""
                     if (number.isBlank()) continue
-                    arr.put(JSONObject().put("name", name).put("number", number))
+                    val accountType = cursor.getString(2)
+                    val accountName = cursor.getString(3)
+                    val (sourceKey, sourceLabel) = classifyContactSource(accountType, accountName)
+                    arr.put(
+                        JSONObject()
+                            .put("name", name)
+                            .put("number", number)
+                            .put("accountType", accountType ?: "")
+                            .put("accountName", accountName ?: "")
+                            .put("source", sourceKey)
+                            .put("sourceLabel", sourceLabel)
+                    )
                     n++
                 }
             }
