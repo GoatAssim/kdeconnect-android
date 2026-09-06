@@ -1,6 +1,5 @@
 /*
  * SPDX-FileCopyrightText: 2026 Jarvis / KDE Connect Call Bridge
- *
  * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
  */
 package org.kde.kdeconnect.plugins.callbridge
@@ -15,12 +14,9 @@ import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.provider.ContactsContract
 import android.telecom.PhoneAccountHandle
 import android.telecom.TelecomManager
-import android.telephony.PhoneStateListener
 import android.telephony.SubscriptionManager
 import android.telephony.TelephonyCallback
 import android.telephony.TelephonyManager
@@ -34,10 +30,6 @@ import org.kde.kdeconnect.plugins.Plugin
 import org.kde.kdeconnect.plugins.PluginFactory.LoadablePlugin
 import org.kde.kdeconnect_tp.R
 
-/**
- * Call control from PC (no remote audio routing).
- * Dual-SIM aware: reports which SIM is ringing, and dial asks for a SIM.
- */
 @LoadablePlugin
 class CallBridgePlugin : Plugin() {
 
@@ -47,12 +39,12 @@ class CallBridgePlugin : Plugin() {
     private var ringerMutedByUs = false
     private var previousRingerMode = AudioManager.RINGER_MODE_NORMAL
 
-    private val mainHandler = Handler(Looper.getMainLooper())
-    private var telephonyCallback: Any? = null
-    private var legacyListener: PhoneStateListener? = null
+    private val telephonyCallbacks = mutableListOf<TelephonyCallback>()
+    private var receiverRegistered = false
 
     private val receiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent) {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent == null) return
             if (TelephonyManager.ACTION_PHONE_STATE_CHANGED != intent.action) return
 
             val stateStr = intent.getStringExtra(TelephonyManager.EXTRA_STATE) ?: return
@@ -66,19 +58,12 @@ class CallBridgePlugin : Plugin() {
                 lastNumber = intent.getStringExtra(TelephonyManager.EXTRA_INCOMING_NUMBER)
             }
 
-            // Dual-SIM: subscription id if present
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
                 val sub = intent.getIntExtra("subscription", SubscriptionManager.INVALID_SUBSCRIPTION_ID)
-                if (sub != SubscriptionManager.INVALID_SUBSCRIPTION_ID) {
-                    lastSubId = sub
-                }
-                val sub2 = intent.getIntExtra(SubscriptionManager.EXTRA_SUBSCRIPTION_INDEX, SubscriptionManager.INVALID_SUBSCRIPTION_ID)
-                if (sub2 != SubscriptionManager.INVALID_SUBSCRIPTION_ID) {
-                    lastSubId = sub2
-                }
+                if (sub != SubscriptionManager.INVALID_SUBSCRIPTION_ID) lastSubId = sub
             }
 
-            onCallStateChanged(intState, lastNumber, lastSubId)
+            handleState(intState)
         }
     }
 
@@ -99,131 +84,113 @@ class CallBridgePlugin : Plugin() {
     override val isEnabledByDefault: Boolean = false
 
     override fun onCreate(): Boolean {
-        // Broadcast (number often arrives on a second broadcast)
-        val filter = IntentFilter(TelephonyManager.ACTION_PHONE_STATE_CHANGED)
-        filter.priority = 999
+        // Never throw out of onCreate — if this fails, the plugin won't receive any packets
         try {
+            val filter = IntentFilter(TelephonyManager.ACTION_PHONE_STATE_CHANGED)
             ContextCompat.registerReceiver(
                 context,
                 receiver,
                 filter,
                 ContextCompat.RECEIVER_EXPORTED
             )
-        } catch (e: Exception) {
+            receiverRegistered = true
+        } catch (e: Throwable) {
             Log.e(TAG, "registerReceiver failed", e)
         }
-
-        // More reliable listener API
-        registerTelephonyListener()
+        try {
+            registerCallListeners()
+        } catch (e: Throwable) {
+            Log.e(TAG, "registerCallListeners failed", e)
+        }
+        Log.i(TAG, "CallBridgePlugin created")
         return true
     }
 
     override fun onDestroy() {
-        try {
-            context.unregisterReceiver(receiver)
-        } catch (_: Exception) {
+        if (receiverRegistered) {
+            try {
+                context.unregisterReceiver(receiver)
+            } catch (_: Throwable) {
+            }
+            receiverRegistered = false
         }
-        unregisterTelephonyListener()
-        restoreRingerIfNeeded()
+        unregisterCallListeners()
+        if (ringerMutedByUs) {
+            try {
+                muteRinger(false)
+            } catch (_: Throwable) {
+            }
+        }
     }
-private val subCallbacks = mutableListOf<Any>()
 
-private fun registerTelephonyListener() {
-    try {
+    private fun registerCallListeners() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE)
             != PackageManager.PERMISSION_GRANTED
         ) {
-            Log.w(TAG, "READ_PHONE_STATE missing")
+            Log.w(TAG, "READ_PHONE_STATE not granted — listeners skipped")
             return
         }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            val sm = context.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE) as SubscriptionManager
-            val list = sm.activeSubscriptionInfoList
-            if (!list.isNullOrEmpty()) {
-                for (info in list) {
-                    val tmForSub = (context.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager)
-                        .createForSubscriptionId(info.subscriptionId)
-                    attachListener(tmForSub, info.subscriptionId)
+        val baseTm = context.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
+        val tms = mutableListOf<TelephonyManager>()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
+            try {
+                val sm = context.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE) as SubscriptionManager
+                val list = sm.activeSubscriptionInfoList
+                if (!list.isNullOrEmpty()) {
+                    for (info in list) {
+                        tms.add(baseTm.createForSubscriptionId(info.subscriptionId))
+                    }
                 }
-                return
+            } catch (e: Throwable) {
+                Log.e(TAG, "list subscriptions failed", e)
             }
         }
+        if (tms.isEmpty()) tms.add(baseTm)
 
-        val tm = context.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
-        attachListener(tm, SubscriptionManager.INVALID_SUBSCRIPTION_ID)
-    } catch (e: Throwable) {
-        Log.e(TAG, "registerTelephonyListener failed", e)
-    }
-}
-
-private fun attachListener(tm: TelephonyManager, subId: Int) {
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-        val cb = object : TelephonyCallback(), TelephonyCallback.CallStateListener {
-            override fun onCallStateChanged(state: Int) {
-                Log.i(TAG, "TelephonyCallback state=$state subId=$subId")
-                if (subId != SubscriptionManager.INVALID_SUBSCRIPTION_ID) {
-                    lastSubId = subId
+        for (tm in tms) {
+            val cb = object : TelephonyCallback(), TelephonyCallback.CallStateListener {
+                override fun onCallStateChanged(state: Int) {
+                    handleState(state)
                 }
-                onCallStateChanged(state, lastNumber, lastSubId)
+            }
+            try {
+                tm.registerTelephonyCallback(context.mainExecutor, cb)
+                telephonyCallbacks.add(cb)
+            } catch (e: Throwable) {
+                Log.e(TAG, "registerTelephonyCallback failed", e)
             }
         }
-        tm.registerTelephonyCallback(context.mainExecutor, cb)
-        subCallbacks.add(cb)
-        telephonyCallback = cb
-    } else {
-        @Suppress("DEPRECATION")
-        val listener = object : PhoneStateListener() {
-            @Deprecated("Deprecated in Java")
-            override fun onCallStateChanged(state: Int, phoneNumber: String?) {
-                if (!phoneNumber.isNullOrBlank()) lastNumber = phoneNumber
-                if (subId != SubscriptionManager.INVALID_SUBSCRIPTION_ID) lastSubId = subId
-                onCallStateChanged(state, lastNumber, lastSubId)
-            }
-        }
-        @Suppress("DEPRECATION")
-        tm.listen(listener, PhoneStateListener.LISTEN_CALL_STATE)
-        legacyListener = listener
-        subCallbacks.add(listener)
     }
-}
 
-    private fun unregisterTelephonyListener() {
+    private fun unregisterCallListeners() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
         try {
             val tm = context.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                (telephonyCallback as? TelephonyCallback)?.let {
-                    tm.unregisterTelephonyCallback(it)
+            for (cb in telephonyCallbacks) {
+                try {
+                    tm.unregisterTelephonyCallback(cb)
+                } catch (_: Throwable) {
                 }
-            } else {
-                @Suppress("DEPRECATION")
-                legacyListener?.let { tm.listen(it, PhoneStateListener.LISTEN_NONE) }
             }
         } catch (_: Throwable) {
         }
-        telephonyCallback = null
-        legacyListener = null
+        telephonyCallbacks.clear()
     }
-private fun onCallStateChanged(state: Int, number: String?, subId: Int) {
-    if (!number.isNullOrBlank()) lastNumber = number
-    if (subId != SubscriptionManager.INVALID_SUBSCRIPTION_ID) lastSubId = subId
 
-    // Always emit on real state change
-    if (state == lastState) {
-        // Number arrived later while still ringing → update PC
-        if (state == TelephonyManager.CALL_STATE_RINGING && !number.isNullOrBlank()) {
-            sendCallEvent(state, lastNumber, lastSubId)
-        }
-        return
+    private fun handleState(state: Int) {
+        if (state == lastState) return
+        lastState = state
+        sendCallEvent(state)
     }
-    lastState = state
-    sendCallEvent(state, lastNumber, lastSubId)
-}
 
     override fun onPacketReceived(np: NetworkPacket): Boolean {
         if (np.type != PACKET_TYPE) return false
+
         val action = np.getString("action")
-        Log.d(TAG, "action=$action")
+        Log.i(TAG, "onPacketReceived action=$action")
 
         val reply = NetworkPacket(PACKET_TYPE)
         reply["action"] = action
@@ -231,6 +198,13 @@ private fun onCallStateChanged(state: Int, number: String?, subId: Int) {
 
         try {
             when (action) {
+                "ping" -> {
+                    reply["body"] = JSONObject()
+                        .put("success", true)
+                        .put("plugin", "callbridge")
+                        .put("message", "pong")
+                        .toString()
+                }
                 "answer" -> reply["body"] = answerCall().toString()
                 "decline", "end", "reject" -> reply["body"] = endCall().toString()
                 "muteRinger" -> reply["body"] = muteRinger(true).toString()
@@ -239,71 +213,72 @@ private fun onCallStateChanged(state: Int, number: String?, subId: Int) {
                 "unmuteMic" -> reply["body"] = setMicMuted(false).toString()
                 "speakerOn" -> reply["body"] = setSpeaker(true).toString()
                 "speakerOff" -> reply["body"] = setSpeaker(false).toString()
-                "dial" -> {
-                    val number = np.getString("number")
-                    val subId = if (np.has("subscriptionId")) np.getInt("subscriptionId") else -1
-                    reply["body"] = dial(number, subId).toString()
-                }
                 "status" -> reply["body"] = currentStatus().toString()
                 "sims.list" -> reply["body"] = listSims().toString()
                 "contacts.list" -> {
                     val query = np.getString("query", "")
                     reply["body"] = listContacts(query).toString()
                 }
-                else -> reply["error"] = "Unknown action: $action"
+                "dial" -> {
+                    val number = np.getString("number")
+                    val subId = np.getInt("subscriptionId", -1)
+                    reply["body"] = dial(number, subId).toString()
+                }
+                else -> {
+                    reply["error"] = "Unknown action: $action"
+                    reply["body"] = JSONObject().put("success", false).put("error", "Unknown action: $action").toString()
+                }
             }
         } catch (e: Throwable) {
-            Log.e(TAG, "Error $action", e)
+            Log.e(TAG, "action failed: $action", e)
             reply["error"] = e.message ?: "error"
+            reply["body"] = JSONObject().put("success", false).put("error", e.message ?: "error").toString()
         }
 
         device.sendPacket(reply)
+        Log.i(TAG, "replied to $action")
         return true
     }
 
-    private fun sendCallEvent(state: Int, number: String?, subId: Int) {
-        val np = NetworkPacket(PACKET_TYPE)
-        np["action"] = "event"
+    private fun sendCallEvent(state: Int) {
+        if (!isDeviceInitialized) return
+        try {
+            val np = NetworkPacket(PACKET_TYPE)
+            np["action"] = "event"
+            val event = when (state) {
+                TelephonyManager.CALL_STATE_RINGING -> "ringing"
+                TelephonyManager.CALL_STATE_OFFHOOK -> "talking"
+                else -> "idle"
+            }
+            np["event"] = event
+            np["phoneNumber"] = lastNumber ?: ""
 
-        val event = when (state) {
-            TelephonyManager.CALL_STATE_RINGING -> "ringing"
-            TelephonyManager.CALL_STATE_OFFHOOK -> "talking"
-            else -> "idle"
+            val sim = simInfo(lastSubId)
+            np["subscriptionId"] = sim.optInt("subscriptionId", -1)
+            np["simSlot"] = sim.optInt("simSlot", -1)
+            np["simName"] = sim.optString("simName", "")
+            np["simCarrier"] = sim.optString("carrierName", "")
+
+            var contactName = lastNumber ?: ""
+            if (!lastNumber.isNullOrBlank() &&
+                ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED
+            ) {
+                val lookup = ContactsHelper.phoneNumberLookup(context, lastNumber!!)
+                if (!lookup.name.isNullOrBlank()) contactName = lookup.name!!
+                val photo = ContactsHelper.photoId64Encoded(context, lookup.photoId)
+                if (photo.isNotEmpty()) np["phoneThumbnail"] = photo
+            }
+            np["contactName"] = contactName
+            if (event == "idle") np["isCancel"] = true
+
+            device.sendPacket(np)
+        } catch (e: Throwable) {
+            Log.e(TAG, "sendCallEvent failed", e)
         }
-        np["event"] = event
-        np["phoneNumber"] = number ?: ""
-
-        val sim = simInfo(subId)
-        np["subscriptionId"] = sim.optInt("subscriptionId", -1)
-        np["simSlot"] = sim.optInt("simSlot", -1)
-        np["simName"] = sim.optString("simName", "")
-        np["simCarrier"] = sim.optString("carrierName", "")
-
-        var contactName = number ?: ""
-        var photoBase64 = ""
-
-        if (!number.isNullOrBlank() &&
-            ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS)
-            == PackageManager.PERMISSION_GRANTED
-        ) {
-            val lookup = ContactsHelper.phoneNumberLookup(context, number)
-            if (!lookup.name.isNullOrBlank()) contactName = lookup.name!!
-            photoBase64 = ContactsHelper.photoId64Encoded(context, lookup.photoId)
-        }
-
-        np["contactName"] = contactName
-        if (photoBase64.isNotEmpty()) {
-            np["phoneThumbnail"] = photoBase64
-        }
-
-        if (event == "idle") {
-            np["isCancel"] = true
-            restoreRingerIfNeeded()
-        }
-
-        Log.i(TAG, "sendCallEvent event=$event number=$number sim=${sim.optString("simName")}")
-        device.sendPacket(np)
     }
+
+    private fun perm(name: String): Boolean =
+        ContextCompat.checkSelfPermission(context, name) == PackageManager.PERMISSION_GRANTED
 
     private fun currentStatus(): JSONObject {
         val o = JSONObject()
@@ -316,45 +291,40 @@ private fun onCallStateChanged(state: Int, number: String?, subId: Int) {
             }
         )
         o.put("phoneNumber", lastNumber ?: "")
+        o.put("perm_phone", perm(Manifest.permission.READ_PHONE_STATE))
+        o.put("perm_call", perm(Manifest.permission.CALL_PHONE))
+        o.put("perm_answer", perm(Manifest.permission.ANSWER_PHONE_CALLS))
+        o.put("perm_contacts", perm(Manifest.permission.READ_CONTACTS))
+        o.put("perm_call_log", perm(Manifest.permission.READ_CALL_LOG))
         val sim = simInfo(lastSubId)
-        o.put("subscriptionId", sim.optInt("subscriptionId", -1))
-        o.put("simSlot", sim.optInt("simSlot", -1))
         o.put("simName", sim.optString("simName", ""))
-        o.put("simCarrier", sim.optString("carrierName", ""))
-        val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        o.put("micMuted", am.isMicrophoneMute)
-        @Suppress("DEPRECATION")
-        o.put("speakerOn", am.isSpeakerphoneOn)
-        o.put("ringerMuted", ringerMutedByUs)
+        o.put("simSlot", sim.optInt("simSlot", -1))
         return o
     }
 
     private fun listSims(): JSONObject {
         val o = JSONObject()
         val arr = JSONArray()
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP_MR1) {
+        o.put("perm_phone", perm(Manifest.permission.READ_PHONE_STATE))
+        if (!perm(Manifest.permission.READ_PHONE_STATE)) {
+            o.put("error", "READ_PHONE_STATE not granted")
             o.put("sims", arr)
             o.put("count", 0)
             return o
         }
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
-            o.put("error", "READ_PHONE_STATE permission missing")
-            o.put("sims", arr)
-            return o
-        }
         try {
-            val sm = context.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE) as SubscriptionManager
-            val list = sm.activeSubscriptionInfoList
-            list?.forEach { info ->
-                val item = JSONObject()
-                item.put("subscriptionId", info.subscriptionId)
-                item.put("simSlot", info.simSlotIndex) // 0-based
-                item.put("simName", info.displayName?.toString() ?: "SIM ${info.simSlotIndex + 1}")
-                item.put("carrierName", info.carrierName?.toString() ?: "")
-                item.put("number", info.number ?: "")
-                arr.put(item)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
+                val sm = context.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE) as SubscriptionManager
+                val list = sm.activeSubscriptionInfoList
+                list?.forEach { info ->
+                    val item = JSONObject()
+                    item.put("subscriptionId", info.subscriptionId)
+                    item.put("simSlot", info.simSlotIndex)
+                    item.put("simName", info.displayName?.toString() ?: "SIM ${info.simSlotIndex + 1}")
+                    item.put("carrierName", info.carrierName?.toString() ?: "")
+                    item.put("number", info.number ?: "")
+                    arr.put(item)
+                }
             }
         } catch (e: Throwable) {
             o.put("error", e.message ?: "listSims failed")
@@ -370,19 +340,12 @@ private fun onCallStateChanged(state: Int, number: String?, subId: Int) {
         o.put("simSlot", -1)
         o.put("simName", "")
         o.put("carrierName", "")
+        if (!perm(Manifest.permission.READ_PHONE_STATE)) return o
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP_MR1) return o
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE)
-            != PackageManager.PERMISSION_GRANTED
-        ) return o
         try {
             val sm = context.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE) as SubscriptionManager
             val list = sm.activeSubscriptionInfoList ?: return o
-            val info = if (subId != SubscriptionManager.INVALID_SUBSCRIPTION_ID) {
-                list.firstOrNull { it.subscriptionId == subId }
-            } else {
-                null
-            }
-            val use = info ?: list.firstOrNull()
+            val use = list.firstOrNull { it.subscriptionId == subId } ?: list.firstOrNull()
             if (use != null) {
                 o.put("subscriptionId", use.subscriptionId)
                 o.put("simSlot", use.simSlotIndex)
@@ -394,24 +357,71 @@ private fun onCallStateChanged(state: Int, number: String?, subId: Int) {
         return o
     }
 
-    private fun answerCall(): JSONObject {
+    private fun listContacts(query: String): JSONObject {
         val o = JSONObject()
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-            o.put("success", false)
-            o.put("error", "Answer requires Android 8+")
+        val arr = JSONArray()
+        o.put("perm_contacts", perm(Manifest.permission.READ_CONTACTS))
+        if (!perm(Manifest.permission.READ_CONTACTS)) {
+            o.put("error", "READ_CONTACTS not granted")
+            o.put("contacts", arr)
+            o.put("count", 0)
             return o
         }
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.ANSWER_PHONE_CALLS)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
+        try {
+            val projection = arrayOf(
+                ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                ContactsContract.CommonDataKinds.Phone.NUMBER
+            )
+            val selection: String?
+            val args: Array<String>?
+            if (query.isBlank()) {
+                selection = null
+                args = null
+            } else {
+                selection =
+                    "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} LIKE ? OR ${ContactsContract.CommonDataKinds.Phone.NUMBER} LIKE ?"
+                args = arrayOf("%$query%", "%$query%")
+            }
+            context.contentResolver.query(
+                ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                projection,
+                selection,
+                args,
+                "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} ASC"
+            ).use { cursor ->
+                var n = 0
+                while (cursor != null && cursor.moveToNext() && n < 300) {
+                    val name = cursor.getString(0) ?: ""
+                    val number = cursor.getString(1) ?: ""
+                    if (number.isBlank()) continue
+                    arr.put(JSONObject().put("name", name).put("number", number))
+                    n++
+                }
+            }
+        } catch (e: Throwable) {
+            o.put("error", e.message ?: "contacts query failed")
+        }
+        o.put("contacts", arr)
+        o.put("count", arr.length())
+        return o
+    }
+
+    private fun answerCall(): JSONObject {
+        val o = JSONObject()
+        if (!perm(Manifest.permission.ANSWER_PHONE_CALLS)) {
             o.put("success", false)
-            o.put("error", "ANSWER_PHONE_CALLS permission missing")
+            o.put("error", "ANSWER_PHONE_CALLS not granted")
             return o
         }
         return try {
-            val tm = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
-            tm.acceptRingingCall()
-            o.put("success", true)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val tm = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
+                tm.acceptRingingCall()
+                o.put("success", true)
+            } else {
+                o.put("success", false)
+                o.put("error", "Need Android 8+")
+            }
             o
         } catch (e: Throwable) {
             o.put("success", false)
@@ -422,23 +432,19 @@ private fun onCallStateChanged(state: Int, number: String?, subId: Int) {
 
     private fun endCall(): JSONObject {
         val o = JSONObject()
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+        if (!perm(Manifest.permission.ANSWER_PHONE_CALLS)) {
             o.put("success", false)
-            o.put("error", "End/reject requires Android 9+")
-            return o
-        }
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.ANSWER_PHONE_CALLS)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
-            o.put("success", false)
-            o.put("error", "ANSWER_PHONE_CALLS permission missing")
+            o.put("error", "ANSWER_PHONE_CALLS not granted")
             return o
         }
         return try {
-            val tm = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
-            val ok = tm.endCall()
-            o.put("success", ok)
-            restoreRingerIfNeeded()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                val tm = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
+                o.put("success", tm.endCall())
+            } else {
+                o.put("success", false)
+                o.put("error", "Need Android 9+")
+            }
             o
         } catch (e: Throwable) {
             o.put("success", false)
@@ -449,8 +455,8 @@ private fun onCallStateChanged(state: Int, number: String?, subId: Int) {
 
     private fun muteRinger(mute: Boolean): JSONObject {
         val o = JSONObject()
-        val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         return try {
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
             if (mute) {
                 previousRingerMode = am.ringerMode
                 am.ringerMode = AudioManager.RINGER_MODE_SILENT
@@ -469,34 +475,27 @@ private fun onCallStateChanged(state: Int, number: String?, subId: Int) {
         }
     }
 
-    private fun restoreRingerIfNeeded() {
-        if (ringerMutedByUs) muteRinger(false)
-    }
-
     private fun setMicMuted(muted: Boolean): JSONObject {
         val o = JSONObject()
-        val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         return try {
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
             am.isMicrophoneMute = muted
             o.put("success", true)
             o.put("micMuted", muted)
             o
         } catch (e: Throwable) {
             o.put("success", false)
-            o.put("error", e.message ?: "mic mute failed")
+            o.put("error", e.message ?: "mic failed")
             o
         }
     }
 
     private fun setSpeaker(on: Boolean): JSONObject {
         val o = JSONObject()
-        val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         return try {
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
             @Suppress("DEPRECATION")
             am.isSpeakerphoneOn = on
-            if (lastState == TelephonyManager.CALL_STATE_OFFHOOK) {
-                am.mode = AudioManager.MODE_IN_CALL
-            }
             o.put("success", true)
             o.put("speakerOn", on)
             o
@@ -506,151 +505,79 @@ private fun onCallStateChanged(state: Int, number: String?, subId: Int) {
             o
         }
     }
-private fun dial(number: String, subscriptionId: Int): JSONObject {
-    val o = JSONObject()
-    if (number.isBlank()) {
-        o.put("success", false)
-        o.put("error", "empty number")
-        return o
-    }
-    if (ContextCompat.checkSelfPermission(context, Manifest.permission.CALL_PHONE)
-        != PackageManager.PERMISSION_GRANTED
-    ) {
-        o.put("success", false)
-        o.put("error", "CALL_PHONE permission missing")
-        return o
-    }
 
-    return try {
-        val uri = Uri.fromParts("tel", number, null)
-        val telecom = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
-        val extras = Bundle()
-
-        if (subscriptionId > 0 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            val handle = phoneAccountHandleForSubId(subscriptionId)
-            if (handle != null) {
-                extras.putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, handle)
-            }
+    private fun dial(number: String, subscriptionId: Int): JSONObject {
+        val o = JSONObject()
+        if (number.isBlank()) {
+            o.put("success", false)
+            o.put("error", "empty number")
+            return o
         }
-
-        // placeCall works from background; startActivity(ACTION_CALL) often does NOT
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            telecom.placeCall(uri, extras)
+        if (!perm(Manifest.permission.CALL_PHONE)) {
+            o.put("success", false)
+            o.put("error", "CALL_PHONE not granted")
+            return o
+        }
+        return try {
+            val uri = Uri.fromParts("tel", number, null)
+            val telecom = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
+            val extras = Bundle()
+            if (subscriptionId > 0 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                phoneAccountHandleForSubId(subscriptionId)?.let {
+                    extras.putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, it)
+                }
+            }
+            // placeCall works from background; startActivity often does not
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                telecom.placeCall(uri, extras)
+            } else {
+                val intent = Intent(Intent.ACTION_CALL, uri)
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                context.startActivity(intent)
+            }
             o.put("success", true)
             o.put("number", number)
             o.put("subscriptionId", subscriptionId)
             o.put("method", "placeCall")
-            return o
+            o
+        } catch (e: Throwable) {
+            Log.e(TAG, "dial failed", e)
+            o.put("success", false)
+            o.put("error", e.message ?: "dial failed")
+            o
         }
-
-        val intent = Intent(Intent.ACTION_CALL, uri)
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        context.startActivity(intent)
-        o.put("success", true)
-        o.put("number", number)
-        o.put("subscriptionId", subscriptionId)
-        o.put("method", "ACTION_CALL")
-        o
-    } catch (e: Throwable) {
-        Log.e(TAG, "dial failed", e)
-        o.put("success", false)
-        o.put("error", e.message ?: "dial failed")
-        o
     }
-}
 
     private fun phoneAccountHandleForSubId(subId: Int): PhoneAccountHandle? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return null
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE)
-            != PackageManager.PERMISSION_GRANTED
-        ) return null
+        if (!perm(Manifest.permission.READ_PHONE_STATE)) return null
         return try {
             val telecom = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
             val accounts = telecom.callCapablePhoneAccounts
-            // Handles are often named with subscription id in id string
-            accounts.firstOrNull { handle ->
-                handle.id.contains(subId.toString())
-            } ?: run {
-                // Fallback: match by slot order
+            accounts.firstOrNull { it.id.contains(subId.toString()) } ?: run {
                 val sm = context.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE) as SubscriptionManager
                 val info = sm.activeSubscriptionInfoList?.firstOrNull { it.subscriptionId == subId }
-                if (info != null && info.simSlotIndex in accounts.indices) {
-                    accounts[info.simSlotIndex]
-                } else null
+                if (info != null && info.simSlotIndex in accounts.indices) accounts[info.simSlotIndex] else null
             }
         } catch (e: Throwable) {
-            Log.e(TAG, "phoneAccountHandleForSubId failed", e)
+            Log.e(TAG, "phoneAccountHandleForSubId", e)
             null
         }
-    }
-
-    private fun listContacts(query: String): JSONObject {
-        val o = JSONObject()
-        val arr = JSONArray()
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
-            o.put("error", "READ_CONTACTS permission missing")
-            o.put("contacts", arr)
-            return o
-        }
-        try {
-            val cr = context.contentResolver
-            val projection = arrayOf(
-                ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
-                ContactsContract.CommonDataKinds.Phone.NUMBER
-            )
-            val selection: String?
-            val args: Array<String>?
-            if (query.isBlank()) {
-                selection = null
-                args = null
-            } else {
-                selection =
-                    "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} LIKE ? OR ${ContactsContract.CommonDataKinds.Phone.NUMBER} LIKE ?"
-                args = arrayOf("%$query%", "%$query%")
-            }
-            cr.query(
-                ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
-                projection,
-                selection,
-                args,
-                "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} ASC"
-            ).use { cursor ->
-                var count = 0
-                while (cursor != null && cursor.moveToNext() && count < 200) {
-                    val name = cursor.getString(0) ?: ""
-                    val number = cursor.getString(1) ?: ""
-                    if (number.isBlank()) continue
-                    val item = JSONObject()
-                    item.put("name", name)
-                    item.put("number", number)
-                    arr.put(item)
-                    count++
-                }
-            }
-            o.put("contacts", arr)
-            o.put("count", arr.length())
-        } catch (e: Throwable) {
-            o.put("error", e.message ?: "contacts failed")
-            o.put("contacts", arr)
-        }
-        return o
     }
 
     override val supportedPacketTypes: Array<String> = arrayOf(PACKET_TYPE)
     override val outgoingPacketTypes: Array<String> = arrayOf(PACKET_TYPE)
 
     override val requiredPermissions: Array<String> = arrayOf(
-        Manifest.permission.READ_PHONE_STATE,
-        Manifest.permission.CALL_PHONE,
-        Manifest.permission.ANSWER_PHONE_CALLS,
-        Manifest.permission.READ_CALL_LOG, // needed on many phones to get incoming number
-    )
+    Manifest.permission.READ_PHONE_STATE,
+    Manifest.permission.CALL_PHONE,
+    Manifest.permission.ANSWER_PHONE_CALLS,
+)
 
-    override val optionalPermissions: Array<String> = arrayOf(
-        Manifest.permission.READ_CONTACTS,
-    )
+override val optionalPermissions: Array<String> = arrayOf(
+    Manifest.permission.READ_CONTACTS,
+    Manifest.permission.READ_CALL_LOG, // only needed on some phones to get the incoming number; must not block ringing detection, SIM listing or dialing
+)
 
     companion object {
         const val PACKET_TYPE = "kdeconnect.callbridge"
