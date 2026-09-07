@@ -184,6 +184,31 @@ class JarvisPlugin : Plugin() {
                 }
                 return true
             }
+            "askConfirmRequest" -> {
+                // A tool flagged confirm_required (see jarvis-cli's
+                // tool_safety.py) has paused the running ask. Shown as its
+                // own bubble, never merged into the assistant's live text,
+                // so Yes/No is always unambiguous even mid-stream.
+                val tool = np.getString("tool")
+                val argumentsJson = np.getString("argumentsJson").ifEmpty { "{}" }
+                val riskProvider = np.getStringOrNull("riskProvider")
+                val riskNote = np.getStringOrNull("riskNote")
+                onMain {
+                    dropThinkingPlaceholder()
+                    askMessages.add(
+                        JarvisChatMessage(
+                            fromUser = false,
+                            text = "",
+                            isConfirm = true,
+                            confirmTool = tool,
+                            confirmArgsJson = argumentsJson,
+                            confirmRiskProvider = riskProvider,
+                            confirmRiskNote = riskNote,
+                        ),
+                    )
+                }
+                return true
+            }
             "screenshot" -> {
                 val filename = np.getString("filename")
                 val data = np.getString("data")
@@ -340,6 +365,17 @@ class JarvisPlugin : Plugin() {
         sendAction("cancel")
     }
 
+    fun respondToConfirm(message: JarvisChatMessage, approved: Boolean) {
+        val idx = askMessages.indexOf(message)
+        if (idx < 0) return
+        askMessages[idx] = message.copy(confirmResolved = true, confirmApproved = approved)
+        // Either way jarvis keeps talking (declining still gets a reply
+        // acknowledging it), so bring the thinking placeholder straight
+        // back — same as right after sending a normal ask.
+        ensureThinkingPlaceholder()
+        sendAction("askConfirmResponse") { it["approved"] = approved }
+    }
+
     fun aiClear() {
         sendAction("aiClear")
     }
@@ -430,6 +466,13 @@ data class JarvisChatMessage(
     val live: Boolean = false,
     val imageBase64: String? = null,
     val thinking: Boolean = false,
+    val isConfirm: Boolean = false,
+    val confirmTool: String? = null,
+    val confirmArgsJson: String? = null,
+    val confirmRiskProvider: String? = null,
+    val confirmRiskNote: String? = null,
+    val confirmResolved: Boolean = false,
+    val confirmApproved: Boolean = false,
 )
 
 data class JarvisSequenceItem(

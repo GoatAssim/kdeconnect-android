@@ -84,6 +84,12 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
     <string name="jarvis_send">Send</string>
     <string name="jarvis_screenshot">Screenshot</string>
     <string name="jarvis_thinking">Jarvis is thinking</string>
+    <string name="jarvis_confirm_title">Confirmation needed</string>
+    <string name="jarvis_confirm_ai_review">AI review</string>
+    <string name="jarvis_confirm_yes">Yes, run it</string>
+    <string name="jarvis_confirm_no">No, cancel</string>
+    <string name="jarvis_confirm_approved">✓ Approved — running…</string>
+    <string name="jarvis_confirm_declined">✗ Declined</string>
     <string name="jarvis_download">Download</string>
     <string name="jarvis_saved">Saved to Downloads</string>
     <string name="jarvis_save_failed">Couldn\'t save the screenshot</string>

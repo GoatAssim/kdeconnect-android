@@ -32,6 +32,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
@@ -653,6 +654,10 @@ private fun AskScreen(plugin: JarvisPlugin, back: () -> Unit) {
         Column(Modifier.padding(padding).fillMaxSize()) {
             LazyColumn(Modifier.weight(1f).padding(16.dp), state = listState) {
                 items(messages) { msg ->
+                    if (msg.isConfirm) {
+                        AskConfirmBubble(msg, onRespond = { approved -> plugin.respondToConfirm(msg, approved) })
+                        return@items
+                    }
                     val bubbleColor = if (msg.fromUser) {
                         MaterialTheme.colorScheme.primaryContainer
                     } else {
@@ -741,6 +746,97 @@ private fun AskScreen(plugin: JarvisPlugin, back: () -> Unit) {
                         },
                     ) {
                         Icon(Icons.AutoMirrored.Filled.Send, stringResource(R.string.jarvis_send))
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AskConfirmBubble(msg: JarvisChatMessage, onRespond: (Boolean) -> Unit) {
+    // A tool flagged confirm_required (see jarvis-cli/jarvis/tool_safety.py)
+    // has paused the running ask — shown as its own distinct bubble (never
+    // merged into the assistant's chat text) so the risk warning can't be
+    // missed, matching the web console's addAskConfirmBubble.
+    val prettyArgs = remember(msg.confirmArgsJson) {
+        try {
+            JSONObject(msg.confirmArgsJson ?: "{}").toString(2)
+        } catch (_: Exception) {
+            msg.confirmArgsJson ?: "{}"
+        }
+    }
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        horizontalArrangement = Arrangement.Start,
+    ) {
+        Card(
+            modifier = Modifier.widthIn(max = 320.dp),
+            shape = RoundedCornerShape(16.dp),
+            colors = androidx.compose.material3.CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.errorContainer,
+            ),
+        ) {
+            Column(Modifier.padding(12.dp)) {
+                Text(
+                    stringResource(R.string.jarvis_confirm_title),
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                )
+                Text(
+                    msg.confirmTool ?: "",
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                    modifier = Modifier.padding(top = 4.dp),
+                )
+                Text(
+                    prettyArgs,
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                    modifier = Modifier.padding(top = 4.dp),
+                )
+                if (!msg.confirmRiskNote.isNullOrEmpty()) {
+                    Column(Modifier.padding(top = 8.dp)) {
+                        val label = if (!msg.confirmRiskProvider.isNullOrEmpty()) {
+                            "${stringResource(R.string.jarvis_confirm_ai_review)} \u2014 ${msg.confirmRiskProvider}"
+                        } else {
+                            stringResource(R.string.jarvis_confirm_ai_review)
+                        }
+                        Text(
+                            label,
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                        )
+                        Text(
+                            msg.confirmRiskNote,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                        )
+                    }
+                }
+                if (msg.confirmResolved) {
+                    Text(
+                        stringResource(
+                            if (msg.confirmApproved) R.string.jarvis_confirm_approved else R.string.jarvis_confirm_declined,
+                        ),
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onErrorContainer,
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                } else {
+                    Row(Modifier.padding(top = 8.dp), horizontalArrangement = Arrangement.End) {
+                        OutlinedButton(onClick = { onRespond(false) }) {
+                            Text(stringResource(R.string.jarvis_confirm_no))
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        Button(onClick = { onRespond(true) }) {
+                            Text(stringResource(R.string.jarvis_confirm_yes))
+                        }
                     }
                 }
             }
