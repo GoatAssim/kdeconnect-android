@@ -35,7 +35,17 @@ class JarvisPlugin : Plugin() {
     val busy = mutableStateOf(false)
     val sequence = mutableStateListOf<JarvisSequenceItem>()
     private val jobId = mutableIntStateOf(1)
-    private var assistantBuffer = StringBuilder()
+    // Raw, not-yet-split lines of the assistant's reply for the turn
+    // currently streaming in (one entry per askStdout packet). Re-split on
+    // every new line via splitConsoleDump() below, mirroring
+    // web/public/app.js's state.askReplyLines/rerenderAskPendingBubble so
+    // the phone and browser clients separate console/tool-trace dump lines
+    // from Jarvis's actual reply the same way.
+    private var assistantReplyLines = mutableListOf<String>()
+    // How many of splitConsoleDump's "dump" lines (for the current turn)
+    // have already been pushed into askConsole, so a re-split on the next
+    // streamed line only appends the new ones instead of duplicating.
+    private var pushedDumpCount = 0
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private fun onMain(block: () -> Unit) {
@@ -114,7 +124,8 @@ class JarvisPlugin : Plugin() {
                     onMain {
                         askMessages.clear()
                         askConsole.clear()
-                        assistantBuffer = StringBuilder()
+                        assistantReplyLines = mutableListOf()
+                        pushedDumpCount = 0
                     }
                 }
                 return true
@@ -157,7 +168,8 @@ class JarvisPlugin : Plugin() {
             "askStart" -> {
                 onMain {
                     busy.value = true
-                    assistantBuffer = StringBuilder()
+                    assistantReplyLines = mutableListOf()
+                    pushedDumpCount = 0
                     ensureThinkingPlaceholder()
                 }
                 return true
@@ -165,8 +177,10 @@ class JarvisPlugin : Plugin() {
             "askStdout" -> {
                 val line = np.getString("line")
                 onMain {
-                    assistantBuffer.append(line).append('\n')
-                    replaceLiveAssistant(assistantBuffer.toString().trimEnd())
+                    assistantReplyLines.add(line)
+                    val split = splitConsoleDump(assistantReplyLines)
+                    pushNewDumpLines(split.dump)
+                    replaceLiveAssistant(split.reply.joinToString("\n").trimEnd())
                 }
                 return true
             }
@@ -265,7 +279,13 @@ class JarvisPlugin : Plugin() {
         if (idx < 0) {
             return
         }
-        val text = assistantBuffer.toString().trimEnd()
+        val split = splitConsoleDump(assistantReplyLines)
+        pushNewDumpLines(split.dump)
+        // If the model's entire "reply" somehow turned out to be dump lines,
+        // fall back to showing everything rather than leaving the bubble
+        // blank (mirrors app.js's finalizeAskBubble).
+        val replyLines = split.reply.ifEmpty { assistantReplyLines }
+        val text = replyLines.joinToString("\n").trimEnd()
         if (text.isNotEmpty()) {
             askMessages[idx] = JarvisChatMessage(false, text, live = false, thinking = false)
         } else if (askMessages[idx].thinking) {
@@ -273,6 +293,17 @@ class JarvisPlugin : Plugin() {
         } else {
             askMessages[idx] = askMessages[idx].copy(live = false, thinking = false)
         }
+    }
+
+    // Pushes only the dump lines beyond what's already been added to
+    // askConsole for this turn, since splitConsoleDump is re-run on the
+    // full accumulated line list every time a new line streams in.
+    private fun pushNewDumpLines(dump: List<String>) {
+        if (dump.size <= pushedDumpCount) return
+        for (i in pushedDumpCount until dump.size) {
+            askConsole.add(JarvisOutputLine("dump", dump[i]))
+        }
+        pushedDumpCount = dump.size
     }
 
     fun parsedCommands(): List<JarvisCommand> {
@@ -459,6 +490,53 @@ data class JarvisVar(
 )
 
 data class JarvisOutputLine(val kind: String, val text: String)
+
+// Jarvis's own CLI output is plain text like "J.A.R.V.I.S: <reply>" (see
+// jarvis-cli's cli.py: handle_ai_prompt). But when the model calls a tool
+// like run_command, it sometimes echoes the tool's raw output verbatim as
+// the start of its own answer, and only *then* writes its actual signed
+// reply. Some providers also echo their own tool-call/tool-result
+// scaffolding as plain text (e.g. "[called run_command with {...}]") instead
+// of routing it through the real function-calling API (see ai_client.py's
+// _TOOL_TRACE_LINE). Either way that content isn't Jarvis "the persona"
+// talking and shouldn't be glued into the same chat bubble as the real
+// reply — it belongs in the Console view instead.
+//
+// This is a straight port of web/public/app.js's splitConsoleDump, kept in
+// sync so the phone and browser clients split the same way.
+private val NAME_PREFIX_LINE = Regex("^([^\\n:]{1,40}):\\s(.*)$")
+private val INLINE_TOOL_TRACE_LINE = Regex("^\\[(called\\s|tool result\\b)", RegexOption.IGNORE_CASE)
+
+data class JarvisConsoleSplit(val name: String?, val dump: List<String>, val reply: List<String>)
+
+private fun splitConsoleDump(lines: List<String>): JarvisConsoleSplit {
+    var splitAt = -1
+    var name: String? = null
+    var firstReplyLine: String? = null
+    for (i in lines.indices) {
+        val m = NAME_PREFIX_LINE.find(lines[i])
+        if (m != null) {
+            splitAt = i
+            name = m.groupValues[1]
+            firstReplyLine = m.groupValues[2]
+            break
+        }
+    }
+
+    val dump = mutableListOf<String>()
+    val candidateReply: List<String> = if (splitAt == -1) {
+        lines.toList()
+    } else {
+        dump.addAll(lines.subList(0, splitAt))
+        listOf(firstReplyLine.orEmpty()) + lines.subList(splitAt + 1, lines.size)
+    }
+
+    val reply = mutableListOf<String>()
+    for (line in candidateReply) {
+        if (INLINE_TOOL_TRACE_LINE.containsMatchIn(line.trim())) dump.add(line.trim()) else reply.add(line)
+    }
+    return JarvisConsoleSplit(name, dump, reply)
+}
 
 data class JarvisChatMessage(
     val fromUser: Boolean,

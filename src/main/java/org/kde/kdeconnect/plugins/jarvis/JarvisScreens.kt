@@ -599,6 +599,10 @@ private fun OutputScreen(plugin: JarvisPlugin, back: () -> Unit, commandOutput: 
                     val color = when (line.kind) {
                         "stderr" -> MaterialTheme.colorScheme.error
                         "exit", "command" -> MaterialTheme.colorScheme.primary
+                        // Console dump split off Jarvis's own reply text —
+                        // raw tool output / tool-call traces the model
+                        // echoed inline (see splitConsoleDump).
+                        "dump" -> MaterialTheme.colorScheme.onSurfaceVariant
                         else -> MaterialTheme.colorScheme.onSurface
                     }
                     Text(line.text, color = color, fontFamily = FontFamily.Monospace)
