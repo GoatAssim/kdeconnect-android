@@ -282,6 +282,32 @@ class JarvisPlugin : Plugin() {
                 }
                 return true
             }
+            "askFileActions" -> {
+                // Paths the desktop plugin spotted (and verified exist) in
+                // the reply that just finished streaming — see
+                // jarvisplugin.cpp's sendCollectedFileActions. Shown as its
+                // own bubble, inserted right before the live/pending
+                // assistant bubble the same way updateConsoleBubble does,
+                // so it reads as "attached to" that reply.
+                val pathsJson = np.getString("pathsJson")
+                if (parseFileActionEntries(pathsJson).isNotEmpty()) {
+                    onMain {
+                        val bubble = JarvisChatMessage(
+                            fromUser = false,
+                            text = "",
+                            isFileActions = true,
+                            fileActionsJson = pathsJson,
+                        )
+                        val insertAt = liveAssistantIndex()
+                        if (insertAt >= 0) {
+                            askMessages.add(insertAt, bubble)
+                        } else {
+                            askMessages.add(bubble)
+                        }
+                    }
+                }
+                return true
+            }
         }
         return false
     }
@@ -466,6 +492,19 @@ class JarvisPlugin : Plugin() {
         sendAction("askConfirmResponse") { it["approved"] = approved }
     }
 
+    // Reveal in Explorer / Open location / Open file for one of the paths
+    // in an askFileActions bubble — kind is "reveal" | "openLocation" |
+    // "openFile", matching jarvisplugin.cpp's handleFileAction. Fire-and-
+    // forget from the UI's point of view: success/failure comes back as a
+    // plain "ok"/"error" packet, surfaced via lastError like any other
+    // action here rather than needing its own round-trip tracking.
+    fun fileAction(path: String, kind: String) {
+        sendAction("fileAction") {
+            it["path"] = path
+            it["fileAction"] = kind
+        }
+    }
+
     fun aiClear() {
         sendAction("aiClear")
     }
@@ -550,6 +589,24 @@ data class JarvisVar(
 
 data class JarvisOutputLine(val kind: String, val text: String)
 
+// One entry from an "askFileActions" packet's pathsJson (see
+// jarvisplugin.cpp's sendCollectedFileActions) — a path the desktop plugin
+// found in Jarvis's reply and already confirmed exists on that PC.
+data class JarvisFileActionEntry(val path: String, val isFolder: Boolean)
+
+fun parseFileActionEntries(json: String?): List<JarvisFileActionEntry> {
+    if (json.isNullOrEmpty()) return emptyList()
+    return try {
+        val arr = JSONArray(json)
+        (0 until arr.length()).map { i ->
+            val obj = arr.getJSONObject(i)
+            JarvisFileActionEntry(obj.optString("path"), obj.optBoolean("isFolder", false))
+        }
+    } catch (_: Exception) {
+        emptyList()
+    }
+}
+
 // One entry from GET /api/config/list, relayed by the desktop plugin as
 // "configList" — mirrors app.js's settingsFiles: whatever *.json files
 // live in the jarvis config dir, auto-discovered rather than hardcoded.
@@ -619,6 +676,12 @@ data class JarvisChatMessage(
     // shown as their own bubble in the thread — mirrors the web app's
     // ask-msg--console bubble (ensureAskTraceBubble/renderAskTrace).
     val isConsole: Boolean = false,
+    // Reveal in Explorer / Open location / Open file buttons for paths the
+    // desktop plugin spotted (and verified exist) in this reply's text —
+    // see JarvisPlugin.onPacketReceived's "askFileActions" case and
+    // jarvisplugin.cpp's collectFileActionCandidates/sendCollectedFileActions.
+    val isFileActions: Boolean = false,
+    val fileActionsJson: String? = null,
 )
 
 data class JarvisSequenceItem(

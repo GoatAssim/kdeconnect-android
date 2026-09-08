@@ -658,6 +658,10 @@ private fun AskScreen(plugin: JarvisPlugin, back: () -> Unit) {
                         AskConfirmBubble(msg, onRespond = { approved -> plugin.respondToConfirm(msg, approved) })
                         return@items
                     }
+                    if (msg.isFileActions) {
+                        AskFileActionsBubble(msg, onAction = { path, kind -> plugin.fileAction(path, kind) })
+                        return@items
+                    }
                     if (msg.isConsole) {
                         AskConsoleBubble(msg)
                         return@items
@@ -881,6 +885,67 @@ private fun AskConfirmBubble(msg: JarvisChatMessage, onRespond: (Boolean) -> Uni
                         Spacer(Modifier.width(8.dp))
                         Button(onClick = { onRespond(true) }) {
                             Text(stringResource(R.string.jarvis_confirm_yes))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AskFileActionsBubble(msg: JarvisChatMessage, onAction: (path: String, kind: String) -> Unit) {
+    // Reveal in Explorer / Open location / Open file buttons for paths the
+    // desktop plugin found (and confirmed exist) in the reply just above
+    // this bubble — see jarvisplugin.cpp's collectFileActionCandidates /
+    // sendCollectedFileActions and JarvisPlugin's "askFileActions" case.
+    // Buttony like AskConfirmBubble above, just informational rather than
+    // blocking anything — there's no ask waiting on the phone tapping one.
+    val entries = remember(msg.fileActionsJson) { parseFileActionEntries(msg.fileActionsJson) }
+    if (entries.isEmpty()) {
+        return
+    }
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        horizontalArrangement = Arrangement.Start,
+    ) {
+        Card(
+            modifier = Modifier.widthIn(max = 320.dp),
+            shape = RoundedCornerShape(16.dp),
+            colors = androidx.compose.material3.CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.secondaryContainer,
+            ),
+        ) {
+            Column(Modifier.padding(12.dp)) {
+                Text(
+                    stringResource(R.string.jarvis_file_actions_title),
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                )
+                for ((index, entry) in entries.withIndex()) {
+                    Column(Modifier.padding(top = if (index == 0) 8.dp else 12.dp)) {
+                        Text(
+                            entry.path,
+                            fontFamily = FontFamily.Monospace,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer,
+                        )
+                        Row(
+                            Modifier.padding(top = 6.dp).fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            OutlinedButton(onClick = { onAction(entry.path, "reveal") }) {
+                                Text(stringResource(R.string.jarvis_file_reveal))
+                            }
+                            OutlinedButton(onClick = { onAction(entry.path, "openLocation") }) {
+                                Text(stringResource(R.string.jarvis_file_open_location))
+                            }
+                            if (!entry.isFolder) {
+                                OutlinedButton(onClick = { onAction(entry.path, "openFile") }) {
+                                    Text(stringResource(R.string.jarvis_file_open))
+                                }
+                            }
                         }
                     }
                 }

@@ -1,0 +1,187 @@
+--- a/src/main/java/org/kde/kdeconnect/plugins/jarvis/JarvisPlugin.kt
++++ b/src/main/java/org/kde/kdeconnect/plugins/jarvis/JarvisPlugin.kt
+@@ -282,6 +282,32 @@
+                 }
+                 return true
+             }
++            "askFileActions" -> {
++                // Paths the desktop plugin spotted (and verified exist) in
++                // the reply that just finished streaming — see
++                // jarvisplugin.cpp's sendCollectedFileActions. Shown as its
++                // own bubble, inserted right before the live/pending
++                // assistant bubble the same way updateConsoleBubble does,
++                // so it reads as "attached to" that reply.
++                val pathsJson = np.getString("pathsJson")
++                if (parseFileActionEntries(pathsJson).isNotEmpty()) {
++                    onMain {
++                        val bubble = JarvisChatMessage(
++                            fromUser = false,
++                            text = "",
++                            isFileActions = true,
++                            fileActionsJson = pathsJson,
++                        )
++                        val insertAt = liveAssistantIndex()
++                        if (insertAt >= 0) {
++                            askMessages.add(insertAt, bubble)
++                        } else {
++                            askMessages.add(bubble)
++                        }
++                    }
++                }
++                return true
++            }
+         }
+         return false
+     }
+@@ -466,6 +492,19 @@
+         sendAction("askConfirmResponse") { it["approved"] = approved }
+     }
+ 
++    // Reveal in Explorer / Open location / Open file for one of the paths
++    // in an askFileActions bubble — kind is "reveal" | "openLocation" |
++    // "openFile", matching jarvisplugin.cpp's handleFileAction. Fire-and-
++    // forget from the UI's point of view: success/failure comes back as a
++    // plain "ok"/"error" packet, surfaced via lastError like any other
++    // action here rather than needing its own round-trip tracking.
++    fun fileAction(path: String, kind: String) {
++        sendAction("fileAction") {
++            it["path"] = path
++            it["fileAction"] = kind
++        }
++    }
++
+     fun aiClear() {
+         sendAction("aiClear")
+     }
+@@ -550,6 +589,24 @@
+ 
+ data class JarvisOutputLine(val kind: String, val text: String)
+ 
++// One entry from an "askFileActions" packet's pathsJson (see
++// jarvisplugin.cpp's sendCollectedFileActions) — a path the desktop plugin
++// found in Jarvis's reply and already confirmed exists on that PC.
++data class JarvisFileActionEntry(val path: String, val isFolder: Boolean)
++
++fun parseFileActionEntries(json: String?): List<JarvisFileActionEntry> {
++    if (json.isNullOrEmpty()) return emptyList()
++    return try {
++        val arr = JSONArray(json)
++        (0 until arr.length()).map { i ->
++            val obj = arr.getJSONObject(i)
++            JarvisFileActionEntry(obj.optString("path"), obj.optBoolean("isFolder", false))
++        }
++    } catch (_: Exception) {
++        emptyList()
++    }
++}
++
+ // One entry from GET /api/config/list, relayed by the desktop plugin as
+ // "configList" — mirrors app.js's settingsFiles: whatever *.json files
+ // live in the jarvis config dir, auto-discovered rather than hardcoded.
+@@ -619,6 +676,12 @@
+     // shown as their own bubble in the thread — mirrors the web app's
+     // ask-msg--console bubble (ensureAskTraceBubble/renderAskTrace).
+     val isConsole: Boolean = false,
++    // Reveal in Explorer / Open location / Open file buttons for paths the
++    // desktop plugin spotted (and verified exist) in this reply's text —
++    // see JarvisPlugin.onPacketReceived's "askFileActions" case and
++    // jarvisplugin.cpp's collectFileActionCandidates/sendCollectedFileActions.
++    val isFileActions: Boolean = false,
++    val fileActionsJson: String? = null,
+ )
+ 
+ data class JarvisSequenceItem(
+--- a/src/main/java/org/kde/kdeconnect/plugins/jarvis/JarvisScreens.kt
++++ b/src/main/java/org/kde/kdeconnect/plugins/jarvis/JarvisScreens.kt
+@@ -658,6 +658,10 @@
+                         AskConfirmBubble(msg, onRespond = { approved -> plugin.respondToConfirm(msg, approved) })
+                         return@items
+                     }
++                    if (msg.isFileActions) {
++                        AskFileActionsBubble(msg, onAction = { path, kind -> plugin.fileAction(path, kind) })
++                        return@items
++                    }
+                     if (msg.isConsole) {
+                         AskConsoleBubble(msg)
+                         return@items
+@@ -884,6 +888,67 @@
+                         }
+                     }
+                 }
++            }
++        }
++    }
++}
++
++@Composable
++private fun AskFileActionsBubble(msg: JarvisChatMessage, onAction: (path: String, kind: String) -> Unit) {
++    // Reveal in Explorer / Open location / Open file buttons for paths the
++    // desktop plugin found (and confirmed exist) in the reply just above
++    // this bubble — see jarvisplugin.cpp's collectFileActionCandidates /
++    // sendCollectedFileActions and JarvisPlugin's "askFileActions" case.
++    // Buttony like AskConfirmBubble above, just informational rather than
++    // blocking anything — there's no ask waiting on the phone tapping one.
++    val entries = remember(msg.fileActionsJson) { parseFileActionEntries(msg.fileActionsJson) }
++    if (entries.isEmpty()) {
++        return
++    }
++    Row(
++        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
++        horizontalArrangement = Arrangement.Start,
++    ) {
++        Card(
++            modifier = Modifier.widthIn(max = 320.dp),
++            shape = RoundedCornerShape(16.dp),
++            colors = androidx.compose.material3.CardDefaults.cardColors(
++                containerColor = MaterialTheme.colorScheme.secondaryContainer,
++            ),
++        ) {
++            Column(Modifier.padding(12.dp)) {
++                Text(
++                    stringResource(R.string.jarvis_file_actions_title),
++                    style = MaterialTheme.typography.labelMedium,
++                    fontWeight = FontWeight.Bold,
++                    color = MaterialTheme.colorScheme.onSecondaryContainer,
++                )
++                for ((index, entry) in entries.withIndex()) {
++                    Column(Modifier.padding(top = if (index == 0) 8.dp else 12.dp)) {
++                        Text(
++                            entry.path,
++                            fontFamily = FontFamily.Monospace,
++                            style = MaterialTheme.typography.bodySmall,
++                            color = MaterialTheme.colorScheme.onSecondaryContainer,
++                        )
++                        Row(
++                            Modifier.padding(top = 6.dp).fillMaxWidth(),
++                            horizontalArrangement = Arrangement.spacedBy(8.dp),
++                        ) {
++                            OutlinedButton(onClick = { onAction(entry.path, "reveal") }) {
++                                Text(stringResource(R.string.jarvis_file_reveal))
++                            }
++                            OutlinedButton(onClick = { onAction(entry.path, "openLocation") }) {
++                                Text(stringResource(R.string.jarvis_file_open_location))
++                            }
++                            if (!entry.isFolder) {
++                                OutlinedButton(onClick = { onAction(entry.path, "openFile") }) {
++                                    Text(stringResource(R.string.jarvis_file_open))
++                                }
++                            }
++                        }
++                    }
++                }
+             }
+         }
+     }
+--- a/src/main/res/values/strings.xml
++++ b/src/main/res/values/strings.xml
+@@ -91,6 +91,10 @@
+     <string name="jarvis_confirm_no">No, cancel</string>
+     <string name="jarvis_confirm_approved">✓ Approved — running…</string>
+     <string name="jarvis_confirm_declined">✗ Declined</string>
++    <string name="jarvis_file_actions_title">Found on your PC</string>
++    <string name="jarvis_file_reveal">Reveal in Explorer</string>
++    <string name="jarvis_file_open_location">Open location</string>
++    <string name="jarvis_file_open">Open file</string>
+     <string name="jarvis_download">Download</string>
+     <string name="jarvis_saved">Saved to Downloads</string>
+     <string name="jarvis_save_failed">Couldn\'t save the screenshot</string>
