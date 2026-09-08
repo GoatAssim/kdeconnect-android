@@ -51,6 +51,7 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
     <string name="jarvis_ask_button">Ask Jarvis</string>
     <string name="jarvis_show_output">Show output</string>
     <string name="jarvis_console">Jarvis output</string>
+    <string name="jarvis_console_bubble_label">Console</string>
     <string name="jarvis_config">Config</string>
     <string name="jarvis_menu">More</string>
     <string name="jarvis_new_command">New command</string>
@@ -94,13 +95,9 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
     <string name="jarvis_saved">Saved to Downloads</string>
     <string name="jarvis_save_failed">Couldn\'t save the screenshot</string>
     <string name="jarvis_share_failed">Couldn\'t share the screenshot</string>
-    <string name="jarvis_config_commands">Commands</string>
-    <string name="jarvis_config_ai">AI</string>
-    <string name="jarvis_config_playnite">Playnite</string>
-    <string name="jarvis_config_spotify">Spotify</string>
-    <string name="jarvis_config_memory">Memory</string>
     <string name="jarvis_reload">Reload</string>
     <string name="jarvis_save_file">Save file</string>
+    <string name="jarvis_config_none_found">No config files found.</string>
     <string name="pref_plugin_contacts">Contacts Synchronizer</string>
     <string name="pref_plugin_contacts_desc">Allow synchronizing the device\'s contacts book</string>
     <string name="pref_plugin_ping">Ping</string>

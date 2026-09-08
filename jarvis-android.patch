@@ -1,0 +1,604 @@
+diff -ruN a/src/main/java/org/kde/kdeconnect/plugins/jarvis/JarvisMarkdown.kt b/src/main/java/org/kde/kdeconnect/plugins/jarvis/JarvisMarkdown.kt
+--- a/src/main/java/org/kde/kdeconnect/plugins/jarvis/JarvisMarkdown.kt	1970-01-01 00:00:00.000000000 +0000
++++ b/src/main/java/org/kde/kdeconnect/plugins/jarvis/JarvisMarkdown.kt	2026-09-08 21:09:01.423728975 +0000
+@@ -0,0 +1,242 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Jarvis KDE Connect integration
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++package org.kde.kdeconnect.plugins.jarvis
++
++import androidx.compose.foundation.background
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.remember
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.text.AnnotatedString
++import androidx.compose.ui.text.SpanStyle
++import androidx.compose.ui.text.buildAnnotatedString
++import androidx.compose.ui.text.font.FontFamily
++import androidx.compose.ui.text.font.FontStyle
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.style.TextDecoration
++import androidx.compose.ui.text.withStyle
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++
++// ===========================================================================
++// A small, dependency-free Markdown renderer for Jarvis's chat bubbles.
++//
++// The web app just hands the raw reply text to marked.js (see app.js's
++// renderMarkdown / finalizeAskBubble: `bubble.innerHTML = renderMarkdown(raw)`).
++// There's no Compose-friendly equivalent bundled with this project, and
++// pulling in a third-party Markdown-for-Compose library isn't something we
++// can verify will resolve cleanly against this project's Gradle/Compose BOM
++// without an actual build, so this covers the common subset by hand:
++// headings, bullet/numbered lists, fenced code blocks, blockquotes,
++// horizontal rules, and inline **bold**/*italic*/`code`/[link](url) — enough
++// to make typical Jarvis replies (which lean on lists and code fences) look
++// right, without chasing full CommonMark parity.
++//
++// Only the assistant's own reply bubble is run through this — see
++// JarvisScreens.kt's AskScreen, which still renders the user's own messages
++// and the "thinking…" placeholder as plain Text, matching how the web app
++// only calls renderMarkdown() on the Jarvis bubble.
++// ===========================================================================
++
++private val HEADING_LINE = Regex("^(#{1,6})\\s+(.*)$")
++private val BULLET_LINE = Regex("^\\s*[-*+]\\s+(.*)$")
++private val NUMBERED_LINE = Regex("^\\s*(\\d+)\\.\\s+(.*)$")
++private val QUOTE_LINE = Regex("^\\s*>\\s?(.*)$")
++private val RULE_LINE = Regex("^\\s*(---+|\\*\\*\\*+|___+)\\s*$")
++private val FENCE_LINE = Regex("^\\s*```.*$")
++
++private sealed class MdBlock {
++    data class Heading(val level: Int, val text: String) : MdBlock()
++    data class Bullet(val text: String) : MdBlock()
++    data class Numbered(val number: String, val text: String) : MdBlock()
++    data class Quote(val text: String) : MdBlock()
++    data class Code(val text: String) : MdBlock()
++    object Rule : MdBlock()
++    data class Paragraph(val text: String) : MdBlock()
++}
++
++private fun parseMarkdownBlocks(text: String): List<MdBlock> {
++    val blocks = mutableListOf<MdBlock>()
++    val lines = text.replace("\r\n", "\n").split("\n")
++    var i = 0
++    val paragraph = StringBuilder()
++
++    fun flushParagraph() {
++        if (paragraph.isNotEmpty()) {
++            blocks.add(MdBlock.Paragraph(paragraph.toString().trim()))
++            paragraph.clear()
++        }
++    }
++
++    while (i < lines.size) {
++        val line = lines[i]
++        when {
++            FENCE_LINE.matches(line) -> {
++                flushParagraph()
++                val codeLines = mutableListOf<String>()
++                i++
++                while (i < lines.size && !FENCE_LINE.matches(lines[i])) {
++                    codeLines.add(lines[i])
++                    i++
++                }
++                blocks.add(MdBlock.Code(codeLines.joinToString("\n")))
++                // Skip the closing fence (if present — an unterminated fence
++                // at end-of-text just runs out of lines, which is fine).
++            }
++            RULE_LINE.matches(line) -> {
++                flushParagraph()
++                blocks.add(MdBlock.Rule)
++            }
++            HEADING_LINE.matches(line) -> {
++                flushParagraph()
++                val m = HEADING_LINE.find(line)!!
++                blocks.add(MdBlock.Heading(m.groupValues[1].length, m.groupValues[2].trim()))
++            }
++            BULLET_LINE.matches(line) -> {
++                flushParagraph()
++                val m = BULLET_LINE.find(line)!!
++                blocks.add(MdBlock.Bullet(m.groupValues[1].trim()))
++            }
++            NUMBERED_LINE.matches(line) -> {
++                flushParagraph()
++                val m = NUMBERED_LINE.find(line)!!
++                blocks.add(MdBlock.Numbered(m.groupValues[1], m.groupValues[2].trim()))
++            }
++            QUOTE_LINE.matches(line) -> {
++                flushParagraph()
++                val m = QUOTE_LINE.find(line)!!
++                blocks.add(MdBlock.Quote(m.groupValues[1].trim()))
++            }
++            line.isBlank() -> flushParagraph()
++            else -> {
++                if (paragraph.isNotEmpty()) paragraph.append(' ')
++                paragraph.append(line.trim())
++            }
++        }
++        i++
++    }
++    flushParagraph()
++    return blocks
++}
++
++// Inline spans: `code`, **bold**/__bold__, *italic*/_italic_, [text](url).
++// Checked in that priority order per match position so code spans win over
++// emphasis markers that might appear inside them.
++private val INLINE_TOKEN = Regex(
++    "`([^`]+)`" +
++        "|\\*\\*([^*]+)\\*\\*" +
++        "|__([^_]+)__" +
++        "|\\*([^*]+)\\*" +
++        "|_([^_]+)_" +
++        "|\\[([^\\]]+)\\]\\(([^)]+)\\)",
++)
++
++private fun buildInlineAnnotatedString(line: String, linkColor: Color): AnnotatedString = buildAnnotatedString {
++    var idx = 0
++    for (m in INLINE_TOKEN.findAll(line)) {
++        if (m.range.first > idx) append(line.substring(idx, m.range.first))
++        val g = m.groups
++        when {
++            g[1] != null -> withStyle(SpanStyle(fontFamily = FontFamily.Monospace)) { append(g[1]!!.value) }
++            g[2] != null -> withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(g[2]!!.value) }
++            g[3] != null -> withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(g[3]!!.value) }
++            g[4] != null -> withStyle(SpanStyle(fontStyle = FontStyle.Italic)) { append(g[4]!!.value) }
++            g[5] != null -> withStyle(SpanStyle(fontStyle = FontStyle.Italic)) { append(g[5]!!.value) }
++            g[6] != null -> withStyle(
++                SpanStyle(color = linkColor, textDecoration = TextDecoration.Underline),
++            ) { append(g[6]!!.value) }
++        }
++        idx = m.range.last + 1
++    }
++    if (idx < line.length) append(line.substring(idx))
++}
++
++/**
++ * Renders [text] as Markdown using the given base [color] for plain text
++ * (headings/bold/links etc. adjust weight/color/decoration on top of it, so
++ * this still reads correctly inside colored chat bubbles).
++ */
++@Composable
++fun JarvisMarkdownText(text: String, color: Color, modifier: Modifier = Modifier) {
++    val blocks = remember(text) { parseMarkdownBlocks(text) }
++    Column(modifier) {
++        blocks.forEachIndexed { index, block ->
++            val topPad = if (index == 0) 0.dp else 4.dp
++            when (block) {
++                is MdBlock.Heading -> {
++                    val size = when (block.level) {
++                        1 -> 20.sp
++                        2 -> 18.sp
++                        else -> 16.sp
++                    }
++                    Text(
++                        buildInlineAnnotatedString(block.text, color),
++                        color = color,
++                        fontWeight = FontWeight.Bold,
++                        fontSize = size,
++                        modifier = Modifier.padding(top = topPad),
++                    )
++                }
++                is MdBlock.Bullet -> {
++                    Row(Modifier.padding(top = topPad)) {
++                        Text("•  ", color = color)
++                        Text(buildInlineAnnotatedString(block.text, color), color = color)
++                    }
++                }
++                is MdBlock.Numbered -> {
++                    Row(Modifier.padding(top = topPad)) {
++                        Text("${block.number}.  ", color = color)
++                        Text(buildInlineAnnotatedString(block.text, color), color = color)
++                    }
++                }
++                is MdBlock.Quote -> {
++                    Text(
++                        buildInlineAnnotatedString(block.text, color),
++                        color = color.copy(alpha = 0.8f),
++                        fontStyle = FontStyle.Italic,
++                        modifier = Modifier.padding(top = topPad, start = 8.dp),
++                    )
++                }
++                is MdBlock.Code -> {
++                    Text(
++                        block.text,
++                        color = color,
++                        fontFamily = FontFamily.Monospace,
++                        style = MaterialTheme.typography.bodySmall,
++                        modifier = Modifier
++                            .padding(top = topPad)
++                            .clip(RoundedCornerShape(8.dp))
++                            .background(color.copy(alpha = 0.12f))
++                            .padding(8.dp),
++                    )
++                }
++                MdBlock.Rule -> {
++                    Row(
++                        Modifier
++                            .padding(top = topPad)
++                            .background(color.copy(alpha = 0.3f)),
++                    ) {
++                        Text(" ", color = color)
++                    }
++                }
++                is MdBlock.Paragraph -> {
++                    Text(
++                        buildInlineAnnotatedString(block.text, color),
++                        color = color,
++                        modifier = Modifier.padding(top = topPad),
++                    )
++                }
++            }
++        }
++    }
++}
+diff -ruN a/src/main/java/org/kde/kdeconnect/plugins/jarvis/JarvisPlugin.kt b/src/main/java/org/kde/kdeconnect/plugins/jarvis/JarvisPlugin.kt
+--- a/src/main/java/org/kde/kdeconnect/plugins/jarvis/JarvisPlugin.kt	2026-09-08 21:09:01.404451389 +0000
++++ b/src/main/java/org/kde/kdeconnect/plugins/jarvis/JarvisPlugin.kt	2026-09-08 21:09:01.423762451 +0000
+@@ -32,6 +32,11 @@
+     val askConsole = mutableStateListOf<JarvisOutputLine>()
+     val configTexts = mutableStateMapOf<String, String>()
+     val configPaths = mutableStateMapOf<String, String>()
++    // Generic, auto-discovered config files (like the web UI's Settings
++    // modal — see server.js's GET /api/config/list / KNOWN_CONFIGS): no
++    // hardcoded tab list here either, whatever *.json files exist in the
++    // jarvis config dir on the desktop show up as a tab.
++    val configFiles = mutableStateListOf<JarvisConfigFile>()
+     val busy = mutableStateOf(false)
+     val sequence = mutableStateListOf<JarvisSequenceItem>()
+     private val jobId = mutableIntStateOf(1)
+@@ -42,10 +47,12 @@
+     // the phone and browser clients separate console/tool-trace dump lines
+     // from Jarvis's actual reply the same way.
+     private var assistantReplyLines = mutableListOf<String>()
+-    // How many of splitConsoleDump's "dump" lines (for the current turn)
+-    // have already been pushed into askConsole, so a re-split on the next
+-    // streamed line only appends the new ones instead of duplicating.
+-    private var pushedDumpCount = 0
++    // Whether this ask-turn's console bubble (if any) has already been
++    // created in askMessages — reset per turn so each new ask gets its own
++    // fresh bubble instead of appending onto a finished previous one,
++    // mirroring the web app's state.askTraceBubble being reset to null in
++    // finalizeAskBubble.
++    private var consoleBubbleShown = false
+     private val mainHandler = Handler(Looper.getMainLooper())
+ 
+     private fun onMain(block: () -> Unit) {
+@@ -119,13 +126,46 @@
+                 }
+                 return true
+             }
++            "configList" -> {
++                val err = np.getString("error")
++                val json = np.getString("filesJson").ifEmpty { "[]" }
++                val files = mutableListOf<JarvisConfigFile>()
++                var parsedOk = true
++                try {
++                    val arr = JSONArray(json)
++                    for (i in 0 until arr.length()) {
++                        val obj = arr.getJSONObject(i)
++                        files.add(
++                            JarvisConfigFile(
++                                name = obj.optString("name"),
++                                label = obj.optString("label").ifEmpty { obj.optString("name") },
++                                hint = obj.optString("hint"),
++                                path = obj.optString("path"),
++                            ),
++                        )
++                    }
++                } catch (_: Exception) {
++                    // Malformed list from the desktop — leave configFiles as-is.
++                    parsedOk = false
++                }
++                onMain {
++                    if (err.isNotEmpty()) {
++                        lastError.value = err
++                    }
++                    if (parsedOk) {
++                        configFiles.clear()
++                        configFiles.addAll(files)
++                    }
++                }
++                return true
++            }
+             "ok" -> {
+                 if (np.getString("action") == "aiClear") {
+                     onMain {
+                         askMessages.clear()
+                         askConsole.clear()
+                         assistantReplyLines = mutableListOf()
+-                        pushedDumpCount = 0
++                        consoleBubbleShown = false
+                     }
+                 }
+                 return true
+@@ -169,7 +209,7 @@
+                 onMain {
+                     busy.value = true
+                     assistantReplyLines = mutableListOf()
+-                    pushedDumpCount = 0
++                    consoleBubbleShown = false
+                     ensureThinkingPlaceholder()
+                 }
+                 return true
+@@ -179,7 +219,7 @@
+                 onMain {
+                     assistantReplyLines.add(line)
+                     val split = splitConsoleDump(assistantReplyLines)
+-                    pushNewDumpLines(split.dump)
++                    updateConsoleBubble(split.dump)
+                     replaceLiveAssistant(split.reply.joinToString("\n").trimEnd())
+                 }
+                 return true
+@@ -280,7 +320,7 @@
+             return
+         }
+         val split = splitConsoleDump(assistantReplyLines)
+-        pushNewDumpLines(split.dump)
++        updateConsoleBubble(split.dump)
+         // If the model's entire "reply" somehow turned out to be dump lines,
+         // fall back to showing everything rather than leaving the bubble
+         // blank (mirrors app.js's finalizeAskBubble).
+@@ -295,15 +335,30 @@
+         }
+     }
+ 
+-    // Pushes only the dump lines beyond what's already been added to
+-    // askConsole for this turn, since splitConsoleDump is re-run on the
+-    // full accumulated line list every time a new line streams in.
+-    private fun pushNewDumpLines(dump: List<String>) {
+-        if (dump.size <= pushedDumpCount) return
+-        for (i in pushedDumpCount until dump.size) {
+-            askConsole.add(JarvisOutputLine("dump", dump[i]))
++    // Creates (once per turn) or updates the dedicated console/tool-trace
++    // bubble in askMessages, inserted right before the live/pending
++    // assistant bubble — mirrors the web app's ensureAskTraceBubble /
++    // renderAskTrace, which keeps a single console bubble per ask-turn that
++    // gets its text replaced wholesale on every re-split rather than
++    // appended to line by line.
++    private fun updateConsoleBubble(dump: List<String>) {
++        if (dump.isEmpty()) {
++            return
+         }
+-        pushedDumpCount = dump.size
++        val text = dump.joinToString("\n")
++        val existingIdx = if (consoleBubbleShown) askMessages.indexOfLast { it.isConsole } else -1
++        if (existingIdx >= 0) {
++            askMessages[existingIdx] = askMessages[existingIdx].copy(text = text)
++            return
++        }
++        val bubble = JarvisChatMessage(fromUser = false, text = text, isConsole = true)
++        val insertAt = liveAssistantIndex()
++        if (insertAt >= 0) {
++            askMessages.add(insertAt, bubble)
++        } else {
++            askMessages.add(bubble)
++        }
++        consoleBubbleShown = true
+     }
+ 
+     fun parsedCommands(): List<JarvisCommand> {
+@@ -350,6 +405,10 @@
+         sendAction("getConfig") { it["which"] = which }
+     }
+ 
++    fun getConfigList() {
++        sendAction("getConfigList")
++    }
++
+     fun setConfig(which: String, text: String) {
+         sendAction("setConfig") {
+             it["which"] = which
+@@ -491,6 +550,11 @@
+ 
+ data class JarvisOutputLine(val kind: String, val text: String)
+ 
++// One entry from GET /api/config/list, relayed by the desktop plugin as
++// "configList" — mirrors app.js's settingsFiles: whatever *.json files
++// live in the jarvis config dir, auto-discovered rather than hardcoded.
++data class JarvisConfigFile(val name: String, val label: String, val hint: String, val path: String)
++
+ // Jarvis's own CLI output is plain text like "J.A.R.V.I.S: <reply>" (see
+ // jarvis-cli's cli.py: handle_ai_prompt). But when the model calls a tool
+ // like run_command, it sometimes echoes the tool's raw output verbatim as
+@@ -551,6 +615,10 @@
+     val confirmRiskNote: String? = null,
+     val confirmResolved: Boolean = false,
+     val confirmApproved: Boolean = false,
++    // Console/tool-trace dump lines split off the reply by splitConsoleDump,
++    // shown as their own bubble in the thread — mirrors the web app's
++    // ask-msg--console bubble (ensureAskTraceBubble/renderAskTrace).
++    val isConsole: Boolean = false,
+ )
+ 
+ data class JarvisSequenceItem(
+diff -ruN a/src/main/java/org/kde/kdeconnect/plugins/jarvis/JarvisScreens.kt b/src/main/java/org/kde/kdeconnect/plugins/jarvis/JarvisScreens.kt
+--- a/src/main/java/org/kde/kdeconnect/plugins/jarvis/JarvisScreens.kt	2026-09-08 21:09:01.404478450 +0000
++++ b/src/main/java/org/kde/kdeconnect/plugins/jarvis/JarvisScreens.kt	2026-09-08 21:09:01.423845900 +0000
+@@ -599,10 +599,6 @@
+                     val color = when (line.kind) {
+                         "stderr" -> MaterialTheme.colorScheme.error
+                         "exit", "command" -> MaterialTheme.colorScheme.primary
+-                        // Console dump split off Jarvis's own reply text —
+-                        // raw tool output / tool-call traces the model
+-                        // echoed inline (see splitConsoleDump).
+-                        "dump" -> MaterialTheme.colorScheme.onSurfaceVariant
+                         else -> MaterialTheme.colorScheme.onSurface
+                     }
+                     Text(line.text, color = color, fontFamily = FontFamily.Monospace)
+@@ -662,6 +658,10 @@
+                         AskConfirmBubble(msg, onRespond = { approved -> plugin.respondToConfirm(msg, approved) })
+                         return@items
+                     }
++                    if (msg.isConsole) {
++                        AskConsoleBubble(msg)
++                        return@items
++                    }
+                     val bubbleColor = if (msg.fromUser) {
+                         MaterialTheme.colorScheme.primaryContainer
+                     } else {
+@@ -716,6 +716,12 @@
+                                         color = textColor.copy(alpha = 0.8f),
+                                         fontStyle = FontStyle.Italic,
+                                     )
++                                } else if (!msg.fromUser) {
++                                    // Only the assistant's own reply gets Markdown
++                                    // rendering — matches the web app, which only
++                                    // calls renderMarkdown() on the Jarvis bubble,
++                                    // never the user's own message.
++                                    JarvisMarkdownText(msg.text, textColor)
+                                 } else {
+                                     Text(msg.text, color = textColor)
+                                 }
+@@ -758,6 +764,41 @@
+ }
+ 
+ @Composable
++private fun AskConsoleBubble(msg: JarvisChatMessage) {
++    // Console/tool-trace output split off Jarvis's reply by splitConsoleDump
++    // (raw command output the model echoed, or inline tool-call/tool-result
++    // trace lines) — shown as its own bubble in the thread instead of being
++    // glued into the assistant's reply text, mirroring the web app's
++    // ask-msg--console bubble (ensureAskTraceBubble/renderAskTrace).
++    Row(
++        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
++        horizontalArrangement = Arrangement.Start,
++    ) {
++        Card(
++            modifier = Modifier.widthIn(max = 320.dp),
++            shape = RoundedCornerShape(16.dp),
++            colors = androidx.compose.material3.CardDefaults.cardColors(
++                containerColor = MaterialTheme.colorScheme.surfaceVariant,
++            ),
++        ) {
++            Column(Modifier.padding(12.dp)) {
++                Text(
++                    stringResource(R.string.jarvis_console_bubble_label),
++                    style = MaterialTheme.typography.labelMedium,
++                    color = MaterialTheme.colorScheme.onSurfaceVariant,
++                )
++                Text(
++                    msg.text,
++                    color = MaterialTheme.colorScheme.onSurfaceVariant,
++                    fontFamily = FontFamily.Monospace,
++                    style = MaterialTheme.typography.bodySmall,
++                )
++            }
++        }
++    }
++}
++
++@Composable
+ private fun AskConfirmBubble(msg: JarvisChatMessage, onRespond: (Boolean) -> Unit) {
+     // A tool flagged confirm_required (see jarvis-cli/jarvis/tool_safety.py)
+     // has paused the running ask — shown as its own distinct bubble (never
+@@ -1007,20 +1048,23 @@
+ 
+ @Composable
+ private fun ConfigScreen(plugin: JarvisPlugin, back: () -> Unit) {
+-    val tabs = listOf("commands", "ai", "playnite", "spotify", "memory")
+-    val labels = listOf(
+-        R.string.jarvis_config_commands,
+-        R.string.jarvis_config_ai,
+-        R.string.jarvis_config_playnite,
+-        R.string.jarvis_config_spotify,
+-        R.string.jarvis_config_memory,
+-    )
++    // Generic like the web UI's Settings modal: the tab list comes from
++    // GET /api/config/list (relayed as plugin.configFiles) instead of a
++    // fixed set of tabs, so any *.json file dropped into the jarvis config
++    // dir on the desktop shows up here with no app update needed.
++    val files = plugin.configFiles
++    LaunchedEffect(Unit) {
++        plugin.getConfigList()
++    }
++
+     var tab by remember { mutableIntStateOf(0) }
+-    val which = tabs[tab]
++    val safeTab = tab.coerceIn(0, (files.size - 1).coerceAtLeast(0))
++    val activeFile = files.getOrNull(safeTab)
++    val which = activeFile?.name.orEmpty()
+     var text by remember { mutableStateOf(plugin.configTexts[which] ?: "") }
+ 
+     LaunchedEffect(which) {
+-        plugin.getConfig(which)
++        if (which.isNotEmpty()) plugin.getConfig(which)
+     }
+     LaunchedEffect(plugin.configTexts[which]) {
+         text = plugin.configTexts[which] ?: text
+@@ -1036,18 +1080,32 @@
+         },
+     ) { padding ->
+         Column(Modifier.padding(padding).fillMaxSize()) {
+-            ScrollableTabRow(selectedTabIndex = tab) {
+-                tabs.forEachIndexed { i, _ ->
++            if (files.isEmpty()) {
++                Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
++                    Text(stringResource(R.string.jarvis_config_none_found))
++                }
++                return@Column
++            }
++            ScrollableTabRow(selectedTabIndex = safeTab) {
++                files.forEachIndexed { i, f ->
+                     Tab(
+-                        selected = tab == i,
++                        selected = safeTab == i,
+                         onClick = { tab = i },
+-                        text = { Text(stringResource(labels[i])) },
++                        text = { Text(f.label) },
+                     )
+                 }
+             }
++            val hint = activeFile?.hint.orEmpty()
++            if (hint.isNotEmpty()) {
++                Text(
++                    hint,
++                    Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
++                    style = MaterialTheme.typography.bodySmall,
++                )
++            }
+             val path = plugin.configPaths[which].orEmpty()
+             if (path.isNotEmpty()) {
+-                Text(path, Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.bodySmall)
++                Text(path, Modifier.padding(horizontal = 16.dp, vertical = 4.dp), style = MaterialTheme.typography.bodySmall)
+             }
+             OutlinedTextField(
+                 value = text,
+diff -ruN a/src/main/res/values/strings.xml b/src/main/res/values/strings.xml
+--- a/src/main/res/values/strings.xml	2026-09-08 21:09:01.413143628 +0000
++++ b/src/main/res/values/strings.xml	2026-09-08 21:09:01.434449347 +0000
+@@ -51,6 +51,7 @@
+     <string name="jarvis_ask_button">Ask Jarvis</string>
+     <string name="jarvis_show_output">Show output</string>
+     <string name="jarvis_console">Jarvis output</string>
++    <string name="jarvis_console_bubble_label">Console</string>
+     <string name="jarvis_config">Config</string>
+     <string name="jarvis_menu">More</string>
+     <string name="jarvis_new_command">New command</string>
+@@ -94,13 +95,9 @@
+     <string name="jarvis_saved">Saved to Downloads</string>
+     <string name="jarvis_save_failed">Couldn\'t save the screenshot</string>
+     <string name="jarvis_share_failed">Couldn\'t share the screenshot</string>
+-    <string name="jarvis_config_commands">Commands</string>
+-    <string name="jarvis_config_ai">AI</string>
+-    <string name="jarvis_config_playnite">Playnite</string>
+-    <string name="jarvis_config_spotify">Spotify</string>
+-    <string name="jarvis_config_memory">Memory</string>
+     <string name="jarvis_reload">Reload</string>
+     <string name="jarvis_save_file">Save file</string>
++    <string name="jarvis_config_none_found">No config files found.</string>
+     <string name="pref_plugin_contacts">Contacts Synchronizer</string>
+     <string name="pref_plugin_contacts_desc">Allow synchronizing the device\'s contacts book</string>
+     <string name="pref_plugin_ping">Ping</string>

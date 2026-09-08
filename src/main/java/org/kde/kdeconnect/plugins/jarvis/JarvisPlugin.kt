@@ -32,6 +32,11 @@ class JarvisPlugin : Plugin() {
     val askConsole = mutableStateListOf<JarvisOutputLine>()
     val configTexts = mutableStateMapOf<String, String>()
     val configPaths = mutableStateMapOf<String, String>()
+    // Generic, auto-discovered config files (like the web UI's Settings
+    // modal — see server.js's GET /api/config/list / KNOWN_CONFIGS): no
+    // hardcoded tab list here either, whatever *.json files exist in the
+    // jarvis config dir on the desktop show up as a tab.
+    val configFiles = mutableStateListOf<JarvisConfigFile>()
     val busy = mutableStateOf(false)
     val sequence = mutableStateListOf<JarvisSequenceItem>()
     private val jobId = mutableIntStateOf(1)
@@ -42,10 +47,12 @@ class JarvisPlugin : Plugin() {
     // the phone and browser clients separate console/tool-trace dump lines
     // from Jarvis's actual reply the same way.
     private var assistantReplyLines = mutableListOf<String>()
-    // How many of splitConsoleDump's "dump" lines (for the current turn)
-    // have already been pushed into askConsole, so a re-split on the next
-    // streamed line only appends the new ones instead of duplicating.
-    private var pushedDumpCount = 0
+    // Whether this ask-turn's console bubble (if any) has already been
+    // created in askMessages — reset per turn so each new ask gets its own
+    // fresh bubble instead of appending onto a finished previous one,
+    // mirroring the web app's state.askTraceBubble being reset to null in
+    // finalizeAskBubble.
+    private var consoleBubbleShown = false
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private fun onMain(block: () -> Unit) {
@@ -119,13 +126,46 @@ class JarvisPlugin : Plugin() {
                 }
                 return true
             }
+            "configList" -> {
+                val err = np.getString("error")
+                val json = np.getString("filesJson").ifEmpty { "[]" }
+                val files = mutableListOf<JarvisConfigFile>()
+                var parsedOk = true
+                try {
+                    val arr = JSONArray(json)
+                    for (i in 0 until arr.length()) {
+                        val obj = arr.getJSONObject(i)
+                        files.add(
+                            JarvisConfigFile(
+                                name = obj.optString("name"),
+                                label = obj.optString("label").ifEmpty { obj.optString("name") },
+                                hint = obj.optString("hint"),
+                                path = obj.optString("path"),
+                            ),
+                        )
+                    }
+                } catch (_: Exception) {
+                    // Malformed list from the desktop — leave configFiles as-is.
+                    parsedOk = false
+                }
+                onMain {
+                    if (err.isNotEmpty()) {
+                        lastError.value = err
+                    }
+                    if (parsedOk) {
+                        configFiles.clear()
+                        configFiles.addAll(files)
+                    }
+                }
+                return true
+            }
             "ok" -> {
                 if (np.getString("action") == "aiClear") {
                     onMain {
                         askMessages.clear()
                         askConsole.clear()
                         assistantReplyLines = mutableListOf()
-                        pushedDumpCount = 0
+                        consoleBubbleShown = false
                     }
                 }
                 return true
@@ -169,7 +209,7 @@ class JarvisPlugin : Plugin() {
                 onMain {
                     busy.value = true
                     assistantReplyLines = mutableListOf()
-                    pushedDumpCount = 0
+                    consoleBubbleShown = false
                     ensureThinkingPlaceholder()
                 }
                 return true
@@ -179,7 +219,7 @@ class JarvisPlugin : Plugin() {
                 onMain {
                     assistantReplyLines.add(line)
                     val split = splitConsoleDump(assistantReplyLines)
-                    pushNewDumpLines(split.dump)
+                    updateConsoleBubble(split.dump)
                     replaceLiveAssistant(split.reply.joinToString("\n").trimEnd())
                 }
                 return true
@@ -280,7 +320,7 @@ class JarvisPlugin : Plugin() {
             return
         }
         val split = splitConsoleDump(assistantReplyLines)
-        pushNewDumpLines(split.dump)
+        updateConsoleBubble(split.dump)
         // If the model's entire "reply" somehow turned out to be dump lines,
         // fall back to showing everything rather than leaving the bubble
         // blank (mirrors app.js's finalizeAskBubble).
@@ -295,15 +335,30 @@ class JarvisPlugin : Plugin() {
         }
     }
 
-    // Pushes only the dump lines beyond what's already been added to
-    // askConsole for this turn, since splitConsoleDump is re-run on the
-    // full accumulated line list every time a new line streams in.
-    private fun pushNewDumpLines(dump: List<String>) {
-        if (dump.size <= pushedDumpCount) return
-        for (i in pushedDumpCount until dump.size) {
-            askConsole.add(JarvisOutputLine("dump", dump[i]))
+    // Creates (once per turn) or updates the dedicated console/tool-trace
+    // bubble in askMessages, inserted right before the live/pending
+    // assistant bubble — mirrors the web app's ensureAskTraceBubble /
+    // renderAskTrace, which keeps a single console bubble per ask-turn that
+    // gets its text replaced wholesale on every re-split rather than
+    // appended to line by line.
+    private fun updateConsoleBubble(dump: List<String>) {
+        if (dump.isEmpty()) {
+            return
         }
-        pushedDumpCount = dump.size
+        val text = dump.joinToString("\n")
+        val existingIdx = if (consoleBubbleShown) askMessages.indexOfLast { it.isConsole } else -1
+        if (existingIdx >= 0) {
+            askMessages[existingIdx] = askMessages[existingIdx].copy(text = text)
+            return
+        }
+        val bubble = JarvisChatMessage(fromUser = false, text = text, isConsole = true)
+        val insertAt = liveAssistantIndex()
+        if (insertAt >= 0) {
+            askMessages.add(insertAt, bubble)
+        } else {
+            askMessages.add(bubble)
+        }
+        consoleBubbleShown = true
     }
 
     fun parsedCommands(): List<JarvisCommand> {
@@ -348,6 +403,10 @@ class JarvisPlugin : Plugin() {
 
     fun getConfig(which: String) {
         sendAction("getConfig") { it["which"] = which }
+    }
+
+    fun getConfigList() {
+        sendAction("getConfigList")
     }
 
     fun setConfig(which: String, text: String) {
@@ -491,6 +550,11 @@ data class JarvisVar(
 
 data class JarvisOutputLine(val kind: String, val text: String)
 
+// One entry from GET /api/config/list, relayed by the desktop plugin as
+// "configList" — mirrors app.js's settingsFiles: whatever *.json files
+// live in the jarvis config dir, auto-discovered rather than hardcoded.
+data class JarvisConfigFile(val name: String, val label: String, val hint: String, val path: String)
+
 // Jarvis's own CLI output is plain text like "J.A.R.V.I.S: <reply>" (see
 // jarvis-cli's cli.py: handle_ai_prompt). But when the model calls a tool
 // like run_command, it sometimes echoes the tool's raw output verbatim as
@@ -551,6 +615,10 @@ data class JarvisChatMessage(
     val confirmRiskNote: String? = null,
     val confirmResolved: Boolean = false,
     val confirmApproved: Boolean = false,
+    // Console/tool-trace dump lines split off the reply by splitConsoleDump,
+    // shown as their own bubble in the thread — mirrors the web app's
+    // ask-msg--console bubble (ensureAskTraceBubble/renderAskTrace).
+    val isConsole: Boolean = false,
 )
 
 data class JarvisSequenceItem(

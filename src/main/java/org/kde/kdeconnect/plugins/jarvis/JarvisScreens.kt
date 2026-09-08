@@ -599,10 +599,6 @@ private fun OutputScreen(plugin: JarvisPlugin, back: () -> Unit, commandOutput: 
                     val color = when (line.kind) {
                         "stderr" -> MaterialTheme.colorScheme.error
                         "exit", "command" -> MaterialTheme.colorScheme.primary
-                        // Console dump split off Jarvis's own reply text —
-                        // raw tool output / tool-call traces the model
-                        // echoed inline (see splitConsoleDump).
-                        "dump" -> MaterialTheme.colorScheme.onSurfaceVariant
                         else -> MaterialTheme.colorScheme.onSurface
                     }
                     Text(line.text, color = color, fontFamily = FontFamily.Monospace)
@@ -662,6 +658,10 @@ private fun AskScreen(plugin: JarvisPlugin, back: () -> Unit) {
                         AskConfirmBubble(msg, onRespond = { approved -> plugin.respondToConfirm(msg, approved) })
                         return@items
                     }
+                    if (msg.isConsole) {
+                        AskConsoleBubble(msg)
+                        return@items
+                    }
                     val bubbleColor = if (msg.fromUser) {
                         MaterialTheme.colorScheme.primaryContainer
                     } else {
@@ -716,6 +716,12 @@ private fun AskScreen(plugin: JarvisPlugin, back: () -> Unit) {
                                         color = textColor.copy(alpha = 0.8f),
                                         fontStyle = FontStyle.Italic,
                                     )
+                                } else if (!msg.fromUser) {
+                                    // Only the assistant's own reply gets Markdown
+                                    // rendering — matches the web app, which only
+                                    // calls renderMarkdown() on the Jarvis bubble,
+                                    // never the user's own message.
+                                    JarvisMarkdownText(msg.text, textColor)
                                 } else {
                                     Text(msg.text, color = textColor)
                                 }
@@ -752,6 +758,41 @@ private fun AskScreen(plugin: JarvisPlugin, back: () -> Unit) {
                         Icon(Icons.AutoMirrored.Filled.Send, stringResource(R.string.jarvis_send))
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AskConsoleBubble(msg: JarvisChatMessage) {
+    // Console/tool-trace output split off Jarvis's reply by splitConsoleDump
+    // (raw command output the model echoed, or inline tool-call/tool-result
+    // trace lines) — shown as its own bubble in the thread instead of being
+    // glued into the assistant's reply text, mirroring the web app's
+    // ask-msg--console bubble (ensureAskTraceBubble/renderAskTrace).
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        horizontalArrangement = Arrangement.Start,
+    ) {
+        Card(
+            modifier = Modifier.widthIn(max = 320.dp),
+            shape = RoundedCornerShape(16.dp),
+            colors = androidx.compose.material3.CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceVariant,
+            ),
+        ) {
+            Column(Modifier.padding(12.dp)) {
+                Text(
+                    stringResource(R.string.jarvis_console_bubble_label),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    msg.text,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.bodySmall,
+                )
             }
         }
     }
@@ -1007,20 +1048,23 @@ private fun shareScreenshot(context: android.content.Context, filename: String, 
 
 @Composable
 private fun ConfigScreen(plugin: JarvisPlugin, back: () -> Unit) {
-    val tabs = listOf("commands", "ai", "playnite", "spotify", "memory")
-    val labels = listOf(
-        R.string.jarvis_config_commands,
-        R.string.jarvis_config_ai,
-        R.string.jarvis_config_playnite,
-        R.string.jarvis_config_spotify,
-        R.string.jarvis_config_memory,
-    )
+    // Generic like the web UI's Settings modal: the tab list comes from
+    // GET /api/config/list (relayed as plugin.configFiles) instead of a
+    // fixed set of tabs, so any *.json file dropped into the jarvis config
+    // dir on the desktop shows up here with no app update needed.
+    val files = plugin.configFiles
+    LaunchedEffect(Unit) {
+        plugin.getConfigList()
+    }
+
     var tab by remember { mutableIntStateOf(0) }
-    val which = tabs[tab]
+    val safeTab = tab.coerceIn(0, (files.size - 1).coerceAtLeast(0))
+    val activeFile = files.getOrNull(safeTab)
+    val which = activeFile?.name.orEmpty()
     var text by remember { mutableStateOf(plugin.configTexts[which] ?: "") }
 
     LaunchedEffect(which) {
-        plugin.getConfig(which)
+        if (which.isNotEmpty()) plugin.getConfig(which)
     }
     LaunchedEffect(plugin.configTexts[which]) {
         text = plugin.configTexts[which] ?: text
@@ -1036,18 +1080,32 @@ private fun ConfigScreen(plugin: JarvisPlugin, back: () -> Unit) {
         },
     ) { padding ->
         Column(Modifier.padding(padding).fillMaxSize()) {
-            ScrollableTabRow(selectedTabIndex = tab) {
-                tabs.forEachIndexed { i, _ ->
+            if (files.isEmpty()) {
+                Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                    Text(stringResource(R.string.jarvis_config_none_found))
+                }
+                return@Column
+            }
+            ScrollableTabRow(selectedTabIndex = safeTab) {
+                files.forEachIndexed { i, f ->
                     Tab(
-                        selected = tab == i,
+                        selected = safeTab == i,
                         onClick = { tab = i },
-                        text = { Text(stringResource(labels[i])) },
+                        text = { Text(f.label) },
                     )
                 }
             }
+            val hint = activeFile?.hint.orEmpty()
+            if (hint.isNotEmpty()) {
+                Text(
+                    hint,
+                    Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
             val path = plugin.configPaths[which].orEmpty()
             if (path.isNotEmpty()) {
-                Text(path, Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.bodySmall)
+                Text(path, Modifier.padding(horizontal = 16.dp, vertical = 4.dp), style = MaterialTheme.typography.bodySmall)
             }
             OutlinedTextField(
                 value = text,
