@@ -276,6 +276,7 @@ class JarvisPlugin : Plugin() {
                 val argumentsJson = np.getString("argumentsJson").ifEmpty { "{}" }
                 val riskProvider = np.getStringOrNull("riskProvider")
                 val riskNote = np.getStringOrNull("riskNote")
+                val hasFlags = np.has("flagConfirmRequired")
                 onMain {
                     dropThinkingPlaceholder()
                     askMessages.add(
@@ -287,8 +288,69 @@ class JarvisPlugin : Plugin() {
                             confirmArgsJson = argumentsJson,
                             confirmRiskProvider = riskProvider,
                             confirmRiskNote = riskNote,
+                            confirmFlagConfirmRequired = if (hasFlags) np.getBoolean("flagConfirmRequired", false) else null,
+                            confirmFlagAiReview = if (hasFlags) np.getBoolean("flagAiReview", false) else null,
+                            confirmCommandRun = np.getStringOrNull("commandRun"),
                         ),
                     )
+                }
+                return true
+            }
+            "runConfirmRequest" -> {
+                // Parallel to askConfirmRequest above, but for a directly-run
+                // saved command on the Run/Output screen (see
+                // commands_config.py/command_tools.py on the CLI side) —
+                // keyed to m_runId, not m_askId, and answered with
+                // runConfirmResponse instead of askConfirmResponse.
+                val tool = np.getString("tool")
+                val argumentsJson = np.getString("argumentsJson").ifEmpty { "{}" }
+                val riskProvider = np.getStringOrNull("riskProvider")
+                val riskNote = np.getStringOrNull("riskNote")
+                val hasFlags = np.has("flagConfirmRequired")
+                onMain {
+                    busy.value = true
+                    runOutput.add(
+                        JarvisOutputLine(
+                            kind = "confirm",
+                            text = "",
+                            confirmTool = tool,
+                            confirmArgsJson = argumentsJson,
+                            confirmRiskProvider = riskProvider,
+                            confirmRiskNote = riskNote,
+                            confirmFlagConfirmRequired = if (hasFlags) np.getBoolean("flagConfirmRequired", false) else null,
+                            confirmFlagAiReview = if (hasFlags) np.getBoolean("flagAiReview", false) else null,
+                            confirmCommandRun = np.getStringOrNull("commandRun"),
+                        ),
+                    )
+                }
+                return true
+            }
+            "presentFile" -> {
+                // The AI tool present_file explicitly showing one specific
+                // file/folder that already exists on the desktop PC — see
+                // jarvisplugin.cpp's JARVIS_MEDIA parsing. No download URL,
+                // only Reveal/Open via the same fileAction plumbing
+                // askFileActions already uses.
+                val name = np.getString("name")
+                val fileType = np.getString("fileType")
+                val sizeBytes = np.getLong("sizeBytes", -1L)
+                val path = np.getString("path")
+                onMain {
+                    val bubble = JarvisChatMessage(
+                        fromUser = false,
+                        text = "",
+                        isPresentFile = true,
+                        presentFileName = name,
+                        presentFileType = fileType,
+                        presentFileSizeBytes = sizeBytes,
+                        presentFilePath = path,
+                    )
+                    val insertAt = liveAssistantIndex()
+                    if (insertAt >= 0) {
+                        askMessages.add(insertAt, bubble)
+                    } else {
+                        askMessages.add(bubble)
+                    }
                 }
                 return true
             }
@@ -576,6 +638,17 @@ class JarvisPlugin : Plugin() {
         sendAction("askConfirmResponse") { it["approved"] = approved }
     }
 
+    // Parallel to respondToConfirm above, but for runOutput/run-flow
+    // confirmations — writes to a different list with a different action
+    // string, and must never be merged with respondToConfirm (the desktop
+    // plugin rejects a response sent under the wrong action for its flow).
+    fun respondToRunConfirm(line: JarvisOutputLine, approved: Boolean) {
+        val idx = runOutput.indexOf(line)
+        if (idx < 0) return
+        runOutput[idx] = line.copy(confirmResolved = true, confirmApproved = approved)
+        sendAction("runConfirmResponse") { it["approved"] = approved }
+    }
+
     // Reveal in Explorer / Open location / Open file for one of the paths
     // in an askFileActions bubble — kind is "reveal" | "openLocation" |
     // "openFile", matching jarvisplugin.cpp's handleFileAction. Fire-and-
@@ -671,7 +744,19 @@ data class JarvisVar(
     val hasDefault: Boolean,
 )
 
-data class JarvisOutputLine(val kind: String, val text: String)
+data class JarvisOutputLine(
+    val kind: String,          // "command" | "stdout" | "stderr" | "exit" | "confirm"
+    val text: String,          // unused when kind == "confirm"; keep "" for consistency
+    val confirmTool: String? = null,
+    val confirmArgsJson: String? = null,
+    val confirmRiskProvider: String? = null,
+    val confirmRiskNote: String? = null,
+    val confirmFlagConfirmRequired: Boolean? = null,
+    val confirmFlagAiReview: Boolean? = null,
+    val confirmCommandRun: String? = null,   // stringify commandRun if it arrives as a JSON value, don't crash if it's an object/array
+    val confirmResolved: Boolean = false,
+    val confirmApproved: Boolean = false,
+)
 
 // One entry from an "askFileActions" packet's pathsJson (see
 // jarvisplugin.cpp's sendCollectedFileActions) — a path the desktop plugin
@@ -776,6 +861,9 @@ data class JarvisChatMessage(
     val confirmArgsJson: String? = null,
     val confirmRiskProvider: String? = null,
     val confirmRiskNote: String? = null,
+    val confirmFlagConfirmRequired: Boolean? = null,
+    val confirmFlagAiReview: Boolean? = null,
+    val confirmCommandRun: String? = null,
     val confirmResolved: Boolean = false,
     val confirmApproved: Boolean = false,
     // Console/tool-trace dump lines split off the reply by splitConsoleDump,
@@ -797,6 +885,16 @@ data class JarvisChatMessage(
     val organizeJsonPath: String? = null,
     val organizeJsonText: String? = null,
     val organizeJsonError: String? = null,
+    // "Shared from your PC" card for the present_file AI tool — a single
+    // file/folder the AI explicitly chose to show, mid-reply. See
+    // JarvisPlugin's "presentFile" packet case and JarvisScreens.kt's
+    // PresentFileBubble. No Download here (see wire-format note in
+    // JarvisPlugin) — only Reveal/Open via plugin.fileAction.
+    val isPresentFile: Boolean = false,
+    val presentFileName: String? = null,
+    val presentFileType: String? = null,   // "file" | "folder"
+    val presentFileSizeBytes: Long? = null, // null or -1 both mean "unknown"
+    val presentFilePath: String? = null,
 )
 
 data class JarvisSequenceItem(

@@ -600,6 +600,10 @@ private fun OutputScreen(plugin: JarvisPlugin, back: () -> Unit, commandOutput: 
         } else {
             LazyColumn(Modifier.padding(padding).fillMaxSize().padding(16.dp), state = listState) {
                 itemsIndexed(lines) { _, line ->
+                    if (line.kind == "confirm") {
+                        RunConfirmBlock(line, onRespond = { approved -> plugin.respondToRunConfirm(line, approved) })
+                        return@itemsIndexed
+                    }
                     val color = when (line.kind) {
                         "stderr" -> MaterialTheme.colorScheme.error
                         "exit", "command" -> MaterialTheme.colorScheme.primary
@@ -703,6 +707,10 @@ private fun AskScreen(plugin: JarvisPlugin, back: () -> Unit) {
                     }
                     if (msg.isConsole) {
                         AskConsoleBubble(msg)
+                        return@items
+                    }
+                    if (msg.isPresentFile) {
+                        PresentFileBubble(msg, onAction = { path, kind -> plugin.fileAction(path, kind) })
                         return@items
                     }
                     val bubbleColor = if (msg.fromUser) {
@@ -886,6 +894,34 @@ private fun AskConfirmBubble(msg: JarvisChatMessage, onRespond: (Boolean) -> Uni
                     color = MaterialTheme.colorScheme.onErrorContainer,
                     modifier = Modifier.padding(top = 4.dp),
                 )
+                if (!msg.confirmCommandRun.isNullOrEmpty()) {
+                    Column(Modifier.padding(top = 8.dp)) {
+                        Text(
+                            stringResource(R.string.jarvis_confirm_will_run),
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                        )
+                        Text(
+                            msg.confirmCommandRun,
+                            fontFamily = FontFamily.Monospace,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                        )
+                    }
+                }
+                if (msg.confirmFlagConfirmRequired != null || msg.confirmFlagAiReview != null) {
+                    Text(
+                        stringResource(
+                            R.string.jarvis_confirm_flags,
+                            msg.confirmFlagConfirmRequired == true,
+                            msg.confirmFlagAiReview == true,
+                        ),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onErrorContainer,
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                }
                 if (!msg.confirmRiskNote.isNullOrEmpty()) {
                     Column(Modifier.padding(top = 8.dp)) {
                         val label = if (!msg.confirmRiskProvider.isNullOrEmpty()) {
@@ -925,6 +961,121 @@ private fun AskConfirmBubble(msg: JarvisChatMessage, onRespond: (Boolean) -> Uni
                         Button(onClick = { onRespond(true) }) {
                             Text(stringResource(R.string.jarvis_confirm_yes))
                         }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RunConfirmBlock(line: JarvisOutputLine, onRespond: (Boolean) -> Unit) {
+    // Close visual port of AskConfirmBubble above, for the run/output
+    // screen's flat list of JarvisOutputLine instead of chat bubbles — see
+    // JarvisPlugin's "runConfirmRequest" packet case and
+    // respondToRunConfirm(). Confirm requests only ever arrive on this
+    // screen, never askConsole.
+    val prettyArgs = remember(line.confirmArgsJson) {
+        try {
+            JSONObject(line.confirmArgsJson ?: "{}").toString(2)
+        } catch (_: Exception) {
+            line.confirmArgsJson ?: "{}"
+        }
+    }
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        shape = RoundedCornerShape(16.dp),
+        colors = androidx.compose.material3.CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.errorContainer,
+        ),
+    ) {
+        Column(Modifier.padding(12.dp)) {
+            Text(
+                stringResource(R.string.jarvis_confirm_title),
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onErrorContainer,
+            )
+            Text(
+                line.confirmTool ?: "",
+                style = MaterialTheme.typography.bodyLarge,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onErrorContainer,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+            Text(
+                prettyArgs,
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onErrorContainer,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+            if (!line.confirmCommandRun.isNullOrEmpty()) {
+                Column(Modifier.padding(top = 8.dp)) {
+                    Text(
+                        stringResource(R.string.jarvis_confirm_will_run),
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onErrorContainer,
+                    )
+                    Text(
+                        line.confirmCommandRun,
+                        fontFamily = FontFamily.Monospace,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onErrorContainer,
+                    )
+                }
+            }
+            if (line.confirmFlagConfirmRequired != null || line.confirmFlagAiReview != null) {
+                Text(
+                    stringResource(
+                        R.string.jarvis_confirm_flags,
+                        line.confirmFlagConfirmRequired == true,
+                        line.confirmFlagAiReview == true,
+                    ),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                    modifier = Modifier.padding(top = 8.dp),
+                )
+            }
+            if (!line.confirmRiskNote.isNullOrEmpty()) {
+                Column(Modifier.padding(top = 8.dp)) {
+                    val label = if (!line.confirmRiskProvider.isNullOrEmpty()) {
+                        "${stringResource(R.string.jarvis_confirm_ai_review)} \u2014 ${line.confirmRiskProvider}"
+                    } else {
+                        stringResource(R.string.jarvis_confirm_ai_review)
+                    }
+                    Text(
+                        label,
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onErrorContainer,
+                    )
+                    Text(
+                        line.confirmRiskNote,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onErrorContainer,
+                    )
+                }
+            }
+            if (line.confirmResolved) {
+                Text(
+                    stringResource(
+                        if (line.confirmApproved) R.string.jarvis_confirm_approved else R.string.jarvis_confirm_declined,
+                    ),
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                    modifier = Modifier.padding(top = 8.dp),
+                )
+            } else {
+                Row(Modifier.padding(top = 8.dp), horizontalArrangement = Arrangement.End) {
+                    OutlinedButton(onClick = { onRespond(false) }) {
+                        Text(stringResource(R.string.jarvis_confirm_no))
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    Button(onClick = { onRespond(true) }) {
+                        Text(stringResource(R.string.jarvis_confirm_yes))
                     }
                 }
             }
@@ -985,6 +1136,103 @@ private fun AskFileActionsBubble(msg: JarvisChatMessage, onAction: (path: String
                                     Text(stringResource(R.string.jarvis_file_open))
                                 }
                             }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Small formatting helper for present_file's sizeBytes — mirrors the spirit
+// of a human-readable byte count without pulling in a dependency.
+private fun formatBytes(bytes: Long): String {
+    if (bytes < 1024) return "$bytes B"
+    val units = arrayOf("KB", "MB", "GB", "TB")
+    var value = bytes.toDouble()
+    var unitIndex = -1
+    while (value >= 1024 && unitIndex < units.lastIndex) {
+        value /= 1024
+        unitIndex++
+    }
+    return "%.1f %s".format(value, units[unitIndex])
+}
+
+@Composable
+private fun PresentFileBubble(msg: JarvisChatMessage, onAction: (path: String, kind: String) -> Unit) {
+    // The present_file AI tool explicitly showing one specific file/folder
+    // already on the desktop PC — see JarvisPlugin's "presentFile" packet
+    // case. Visual reference is AskFileActionsBubble, but this card only
+    // ever describes one file, not a list — and there's no Download button
+    // here (no backing endpoint from this plugin, see wire-format note).
+    val isFolder = msg.presentFileType == "folder"
+    val sizeBytes = msg.presentFileSizeBytes
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        horizontalArrangement = Arrangement.Start,
+    ) {
+        Card(
+            modifier = Modifier.widthIn(max = 320.dp),
+            shape = RoundedCornerShape(16.dp),
+            colors = androidx.compose.material3.CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.secondaryContainer,
+            ),
+        ) {
+            Column(Modifier.padding(12.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        if (isFolder) "\uD83D\uDCC1" else "\uD83D\uDCC4",
+                        style = MaterialTheme.typography.bodyLarge,
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        stringResource(R.string.jarvis_present_file_title),
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    )
+                }
+                Text(
+                    msg.presentFileName ?: "",
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    modifier = Modifier.padding(top = 8.dp),
+                )
+                val typeLabel = stringResource(
+                    if (isFolder) R.string.jarvis_present_file_folder else R.string.jarvis_present_file_file,
+                )
+                val sizeLabel = if (sizeBytes == null || sizeBytes < 0) {
+                    stringResource(R.string.jarvis_present_file_size_unknown)
+                } else {
+                    formatBytes(sizeBytes)
+                }
+                Text(
+                    "$typeLabel \u2013 $sizeLabel",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                )
+                Text(
+                    msg.presentFilePath ?: "",
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    modifier = Modifier.padding(top = 4.dp),
+                )
+                Row(
+                    Modifier.padding(top = 8.dp).fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    val path = msg.presentFilePath.orEmpty()
+                    OutlinedButton(onClick = { onAction(path, "reveal") }) {
+                        Text(stringResource(R.string.jarvis_file_reveal))
+                    }
+                    OutlinedButton(onClick = { onAction(path, "openLocation") }) {
+                        Text(stringResource(R.string.jarvis_file_open_location))
+                    }
+                    if (!isFolder) {
+                        OutlinedButton(onClick = { onAction(path, "openFile") }) {
+                            Text(stringResource(R.string.jarvis_file_open))
                         }
                     }
                 }

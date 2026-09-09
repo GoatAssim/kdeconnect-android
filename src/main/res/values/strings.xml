@@ -99,6 +99,12 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
     <string name="jarvis_file_open_location">Open location</string>
     <string name="jarvis_file_open">Open file</string>
     <string name="jarvis_download">Download</string>
+    <string name="jarvis_present_file_title">Shared from your PC</string>
+    <string name="jarvis_present_file_folder">Folder</string>
+    <string name="jarvis_present_file_file">File</string>
+    <string name="jarvis_present_file_size_unknown">size unknown</string>
+    <string name="jarvis_confirm_will_run">Will run:</string>
+    <string name="jarvis_confirm_flags">Confirm required: %1$s   AI review: %2$s</string>
     <string name="jarvis_saved">Saved to Downloads</string>
     <string name="jarvis_save_failed">Couldn\'t save the screenshot</string>
     <string name="jarvis_share_failed">Couldn\'t share the screenshot</string>
