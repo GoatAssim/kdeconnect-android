@@ -437,6 +437,32 @@ class JarvisPlugin : Plugin() {
         sendAction("requestStatus")
     }
 
+    // Cycle/set the global capacity mode — mirrors the web UI's
+    // #btn-mode-switch click handler (Api.setMode). This is a real, global
+    // change: jarvisplugin.cpp's handleSetMode() POSTs the exact same
+    // /api/mode the browser uses, which persists to ~/.jarvis/ai_config.json
+    // on the desktop, so it applies to every client (every browser tab, any
+    // other paired phone, jarvis-cli itself) — not just this device.
+    fun setMode(mode: String) {
+        sendAction("setMode") { it["mode"] = mode }
+    }
+
+    // Step to the next mode in capacityModeOptions' cycle order, wrapping
+    // around, same as the web UI's click handler. No-op if options haven't
+    // arrived from the desktop yet (falls back to requesting status so the
+    // next tap has something to cycle through).
+    fun cycleMode() {
+        val options = capacityModeOptions
+        if (options.isEmpty()) {
+            requestStatus()
+            return
+        }
+        val current = capacityMode.value
+        val idx = options.indexOfFirst { it.mode == current }
+        val next = options[(maxOf(idx, 0) + 1) % options.size]
+        setMode(next.mode)
+    }
+
     fun createCommand(name: String, spec: JSONObject) {
         sendAction("createCommand") {
             it["name"] = name
@@ -631,6 +657,28 @@ fun parseFileActionEntries(json: String?): List<JarvisFileActionEntry> {
             val obj = arr.getJSONObject(i)
             JarvisFileActionEntry(obj.optString("path"), obj.optBoolean("isFolder", false))
         }
+    } catch (_: Exception) {
+        emptyList()
+    }
+}
+
+// One entry from /api/mode's "options" array (ai_client.mode_options() on
+// the CLI side), relayed by the desktop plugin as "mode"'s optionsJson —
+// mirrors the web UI's modeOptions ({mode,label,summary} in cycle order).
+data class JarvisModeOption(val mode: String, val label: String, val summary: String)
+
+fun parseModeOptions(json: String?): List<JarvisModeOption> {
+    if (json.isNullOrEmpty()) return emptyList()
+    return try {
+        val arr = JSONArray(json)
+        (0 until arr.length()).map { i ->
+            val obj = arr.getJSONObject(i)
+            JarvisModeOption(
+                mode = obj.optString("mode"),
+                label = obj.optString("label").ifEmpty { obj.optString("mode") },
+                summary = obj.optString("summary"),
+            )
+        }.filter { it.mode.isNotEmpty() }
     } catch (_: Exception) {
         emptyList()
     }

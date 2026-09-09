@@ -91,6 +91,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -158,6 +160,7 @@ private fun CommandsScreen(
                 subTitle = deviceName,
                 navIconOnClick = back,
                 actions = {
+                    ModeSwitchButton(plugin)
                     IconButton(onClick = { menu = true }) {
                         Icon(Icons.Default.MoreVert, stringResource(R.string.jarvis_menu))
                     }
@@ -608,6 +611,36 @@ private fun OutputScreen(plugin: JarvisPlugin, back: () -> Unit, commandOutput: 
     }
 }
 
+// Global capacity-mode switch — mirrors the web UI's #btn-mode-switch:
+// tapping always steps to the next mode in plugin.capacityModeOptions'
+// order and persists it via plugin.setMode(), which is a real, global
+// change on the desktop (affects every browser tab, any other paired
+// phone, jarvis-cli itself), not something local to this button. Shown
+// wherever the web puts its topbar switch's phone-sized equivalent: the
+// main commands screen and the ask screen.
+@Composable
+private fun ModeSwitchButton(plugin: JarvisPlugin) {
+    val options = plugin.capacityModeOptions
+    val mode = plugin.capacityMode.value
+    val label = plugin.capacityModeLabel.value.ifEmpty { stringResource(R.string.jarvis_mode_fallback) }
+    val current = options.find { it.mode == mode }
+    val idx = if (current != null) options.indexOf(current) else -1
+    val next = if (options.isNotEmpty()) options[(maxOf(idx, 0) + 1) % options.size] else null
+    val description = if (next != null) {
+        stringResource(R.string.jarvis_mode_switch_desc, current?.label ?: label, next.label)
+    } else {
+        stringResource(R.string.jarvis_mode_switch_desc_no_next, label)
+    }
+
+    TextButton(
+        onClick = { plugin.cycleMode() },
+        enabled = !plugin.busy.value,
+        modifier = Modifier.semantics { contentDescription = description },
+    ) {
+        Text(label)
+    }
+}
+
 @Composable
 private fun AskScreen(plugin: JarvisPlugin, back: () -> Unit) {
     var input by remember { mutableStateOf("") }
@@ -641,6 +674,7 @@ private fun AskScreen(plugin: JarvisPlugin, back: () -> Unit) {
                 title = stringResource(R.string.jarvis_ask_button),
                 navIconOnClick = back,
                 actions = {
+                    ModeSwitchButton(plugin)
                     TextButton(onClick = { showConsole = true }) {
                         Text(stringResource(R.string.jarvis_console))
                     }

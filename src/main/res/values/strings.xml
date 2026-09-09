@@ -102,6 +102,9 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
     <string name="jarvis_reload">Reload</string>
     <string name="jarvis_save_file">Save file</string>
     <string name="jarvis_config_none_found">No config files found.</string>
+    <string name="jarvis_mode_fallback">Capacity</string>
+    <string name="jarvis_mode_switch_desc">Capacity mode: %1$s. Tap to switch to %2$s.</string>
+    <string name="jarvis_mode_switch_desc_no_next">Capacity mode: %1$s.</string>
     <string name="pref_plugin_contacts">Contacts Synchronizer</string>
     <string name="pref_plugin_contacts_desc">Allow synchronizing the device\'s contacts book</string>
     <string name="pref_plugin_ping">Ping</string>

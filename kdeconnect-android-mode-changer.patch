@@ -1,0 +1,143 @@
+diff -ruN a/src/main/java/org/kde/kdeconnect/plugins/jarvis/JarvisPlugin.kt b/src/main/java/org/kde/kdeconnect/plugins/jarvis/JarvisPlugin.kt
+--- a/src/main/java/org/kde/kdeconnect/plugins/jarvis/JarvisPlugin.kt	2026-09-09 00:00:37.000000000 +0000
++++ b/src/main/java/org/kde/kdeconnect/plugins/jarvis/JarvisPlugin.kt	2026-09-09 00:08:45.062294011 +0000
+@@ -437,6 +437,32 @@
+         sendAction("requestStatus")
+     }
+ 
++    // Cycle/set the global capacity mode — mirrors the web UI's
++    // #btn-mode-switch click handler (Api.setMode). This is a real, global
++    // change: jarvisplugin.cpp's handleSetMode() POSTs the exact same
++    // /api/mode the browser uses, which persists to ~/.jarvis/ai_config.json
++    // on the desktop, so it applies to every client (every browser tab, any
++    // other paired phone, jarvis-cli itself) — not just this device.
++    fun setMode(mode: String) {
++        sendAction("setMode") { it["mode"] = mode }
++    }
++
++    // Step to the next mode in capacityModeOptions' cycle order, wrapping
++    // around, same as the web UI's click handler. No-op if options haven't
++    // arrived from the desktop yet (falls back to requesting status so the
++    // next tap has something to cycle through).
++    fun cycleMode() {
++        val options = capacityModeOptions
++        if (options.isEmpty()) {
++            requestStatus()
++            return
++        }
++        val current = capacityMode.value
++        val idx = options.indexOfFirst { it.mode == current }
++        val next = options[(maxOf(idx, 0) + 1) % options.size]
++        setMode(next.mode)
++    }
++
+     fun createCommand(name: String, spec: JSONObject) {
+         sendAction("createCommand") {
+             it["name"] = name
+@@ -634,6 +660,28 @@
+     } catch (_: Exception) {
+         emptyList()
+     }
++}
++
++// One entry from /api/mode's "options" array (ai_client.mode_options() on
++// the CLI side), relayed by the desktop plugin as "mode"'s optionsJson —
++// mirrors the web UI's modeOptions ({mode,label,summary} in cycle order).
++data class JarvisModeOption(val mode: String, val label: String, val summary: String)
++
++fun parseModeOptions(json: String?): List<JarvisModeOption> {
++    if (json.isNullOrEmpty()) return emptyList()
++    return try {
++        val arr = JSONArray(json)
++        (0 until arr.length()).map { i ->
++            val obj = arr.getJSONObject(i)
++            JarvisModeOption(
++                mode = obj.optString("mode"),
++                label = obj.optString("label").ifEmpty { obj.optString("mode") },
++                summary = obj.optString("summary"),
++            )
++        }.filter { it.mode.isNotEmpty() }
++    } catch (_: Exception) {
++        emptyList()
++    }
+ }
+ 
+ // One entry from GET /api/config/list, relayed by the desktop plugin as
+diff -ruN a/src/main/java/org/kde/kdeconnect/plugins/jarvis/JarvisScreens.kt b/src/main/java/org/kde/kdeconnect/plugins/jarvis/JarvisScreens.kt
+--- a/src/main/java/org/kde/kdeconnect/plugins/jarvis/JarvisScreens.kt	2026-09-09 00:00:37.000000000 +0000
++++ b/src/main/java/org/kde/kdeconnect/plugins/jarvis/JarvisScreens.kt	2026-09-09 00:08:45.062361561 +0000
+@@ -91,6 +91,8 @@
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.semantics.contentDescription
++import androidx.compose.ui.semantics.semantics
+ import androidx.compose.ui.text.font.FontFamily
+ import androidx.compose.ui.text.font.FontWeight
+ import androidx.compose.ui.unit.dp
+@@ -158,6 +160,7 @@
+                 subTitle = deviceName,
+                 navIconOnClick = back,
+                 actions = {
++                    ModeSwitchButton(plugin)
+                     IconButton(onClick = { menu = true }) {
+                         Icon(Icons.Default.MoreVert, stringResource(R.string.jarvis_menu))
+                     }
+@@ -608,6 +611,36 @@
+     }
+ }
+ 
++// Global capacity-mode switch — mirrors the web UI's #btn-mode-switch:
++// tapping always steps to the next mode in plugin.capacityModeOptions'
++// order and persists it via plugin.setMode(), which is a real, global
++// change on the desktop (affects every browser tab, any other paired
++// phone, jarvis-cli itself), not something local to this button. Shown
++// wherever the web puts its topbar switch's phone-sized equivalent: the
++// main commands screen and the ask screen.
++@Composable
++private fun ModeSwitchButton(plugin: JarvisPlugin) {
++    val options = plugin.capacityModeOptions
++    val mode = plugin.capacityMode.value
++    val label = plugin.capacityModeLabel.value.ifEmpty { stringResource(R.string.jarvis_mode_fallback) }
++    val current = options.find { it.mode == mode }
++    val idx = if (current != null) options.indexOf(current) else -1
++    val next = if (options.isNotEmpty()) options[(maxOf(idx, 0) + 1) % options.size] else null
++    val description = if (next != null) {
++        stringResource(R.string.jarvis_mode_switch_desc, current?.label ?: label, next.label)
++    } else {
++        stringResource(R.string.jarvis_mode_switch_desc_no_next, label)
++    }
++
++    TextButton(
++        onClick = { plugin.cycleMode() },
++        enabled = !plugin.busy.value,
++        modifier = Modifier.semantics { contentDescription = description },
++    ) {
++        Text(label)
++    }
++}
++
+ @Composable
+ private fun AskScreen(plugin: JarvisPlugin, back: () -> Unit) {
+     var input by remember { mutableStateOf("") }
+@@ -641,6 +674,7 @@
+                 title = stringResource(R.string.jarvis_ask_button),
+                 navIconOnClick = back,
+                 actions = {
++                    ModeSwitchButton(plugin)
+                     TextButton(onClick = { showConsole = true }) {
+                         Text(stringResource(R.string.jarvis_console))
+                     }
+diff -ruN a/src/main/res/values/strings.xml b/src/main/res/values/strings.xml
+--- a/src/main/res/values/strings.xml	2026-09-09 00:00:37.000000000 +0000
++++ b/src/main/res/values/strings.xml	2026-09-09 00:08:45.089466459 +0000
+@@ -102,6 +102,9 @@
+     <string name="jarvis_reload">Reload</string>
+     <string name="jarvis_save_file">Save file</string>
+     <string name="jarvis_config_none_found">No config files found.</string>
++    <string name="jarvis_mode_fallback">Capacity</string>
++    <string name="jarvis_mode_switch_desc">Capacity mode: %1$s. Tap to switch to %2$s.</string>
++    <string name="jarvis_mode_switch_desc_no_next">Capacity mode: %1$s.</string>
+     <string name="pref_plugin_contacts">Contacts Synchronizer</string>
+     <string name="pref_plugin_contacts_desc">Allow synchronizing the device\'s contacts book</string>
+     <string name="pref_plugin_ping">Ping</string>
