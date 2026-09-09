@@ -39,6 +39,13 @@ class JarvisPlugin : Plugin() {
     val configFiles = mutableStateListOf<JarvisConfigFile>()
     val busy = mutableStateOf(false)
     val sequence = mutableStateListOf<JarvisSequenceItem>()
+    // Global capacity mode (mirrors the web UI's topbar #btn-mode-switch —
+    // NOT the debug dashboard's local-only override). Pushed proactively by
+    // the desktop plugin on every connect/requestStatus (see sendMode() in
+    // jarvisplugin.cpp) and again whenever this device calls setMode().
+    val capacityMode = mutableStateOf("")
+    val capacityModeLabel = mutableStateOf("")
+    val capacityModeOptions = mutableStateListOf<JarvisModeOption>()
     private val jobId = mutableIntStateOf(1)
     // Raw, not-yet-split lines of the assistant's reply for the turn
     // currently streaming in (one entry per askStdout packet). Re-split on
@@ -123,6 +130,28 @@ class JarvisPlugin : Plugin() {
                     }
                     configTexts[which] = text
                     configPaths[which] = path
+                }
+                return true
+            }
+            "mode" -> {
+                // Real global capacity mode (see sendMode()/handleSetMode()
+                // in jarvisplugin.cpp) — distinct from any per-call debug
+                // override; there's no such override reachable from here.
+                val err = np.getString("error")
+                val mode = np.getString("mode")
+                val options = parseModeOptions(np.getString("optionsJson"))
+                onMain {
+                    if (err.isNotEmpty()) {
+                        lastError.value = err
+                    }
+                    if (options.isNotEmpty()) {
+                        capacityModeOptions.clear()
+                        capacityModeOptions.addAll(options)
+                    }
+                    if (mode.isNotEmpty()) {
+                        capacityMode.value = mode
+                        capacityModeLabel.value = capacityModeOptions.find { it.mode == mode }?.label ?: mode
+                    }
                 }
                 return true
             }
