@@ -710,7 +710,11 @@ private fun AskScreen(plugin: JarvisPlugin, back: () -> Unit) {
                         return@items
                     }
                     if (msg.isPresentFile) {
-                        PresentFileBubble(msg, onAction = { path, kind -> plugin.fileAction(path, kind) })
+                        PresentFileBubble(
+                            msg,
+                            onAction = { path, kind -> plugin.fileAction(path, kind) },
+                            onDownload = { jobId, filename -> plugin.downloadFile(jobId, filename) },
+                        )
                         return@items
                     }
                     val bubbleColor = if (msg.fromUser) {
@@ -1159,7 +1163,11 @@ private fun formatBytes(bytes: Long): String {
 }
 
 @Composable
-private fun PresentFileBubble(msg: JarvisChatMessage, onAction: (path: String, kind: String) -> Unit) {
+private fun PresentFileBubble(
+    msg: JarvisChatMessage,
+    onAction: (path: String, kind: String) -> Unit,
+    onDownload: (jobId: String, filename: String) -> Unit,
+) {
     // The present_file AI tool explicitly showing one specific file/folder
     // already on the desktop PC — see JarvisPlugin's "presentFile" packet
     // case. Visual reference is AskFileActionsBubble, but this card only
@@ -1223,8 +1231,15 @@ private fun PresentFileBubble(msg: JarvisChatMessage, onAction: (path: String, k
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
                     val path = msg.presentFilePath.orEmpty()
-                    OutlinedButton(onClick = { onAction(path, "download") }) {
-                        Text(stringResource(R.string.jarvis_download))
+                    val jobId = msg.presentFileDownloadJobId
+                    val downloadFilename = msg.presentFileDownloadFilename
+                    // Only offered when the desktop actually prepared a copy
+                    // (see present_tools.py's DOWNLOAD_SIZE_CAP) — mirrors the
+                    // web UI hiding its own Download button in that case.
+                    if (jobId != null && downloadFilename != null) {
+                        OutlinedButton(onClick = { onDownload(jobId, downloadFilename) }) {
+                            Text(stringResource(R.string.jarvis_download))
+                        }
                     }
                     if (!isFolder) {
                         OutlinedButton(onClick = { onAction(path, "openFile") }) {

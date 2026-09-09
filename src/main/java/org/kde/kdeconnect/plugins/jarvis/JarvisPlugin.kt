@@ -5,10 +5,17 @@
  */
 package org.kde.kdeconnect.plugins.jarvis
 
+import android.content.ContentValues
+import android.content.Context
+import android.os.Build
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.content.Intent
+import android.provider.MediaStore
 import android.util.Log
+import java.io.File
+import java.io.InputStream
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateMapOf
@@ -16,6 +23,7 @@ import androidx.compose.runtime.mutableStateOf
 import org.json.JSONArray
 import org.json.JSONObject
 import org.kde.kdeconnect.NetworkPacket
+import org.kde.kdeconnect.helpers.MediaStoreHelper
 import org.kde.kdeconnect.plugins.Plugin
 import org.kde.kdeconnect.plugins.PluginFactory.LoadablePlugin
 import org.kde.kdeconnect_tp.R
@@ -335,6 +343,8 @@ class JarvisPlugin : Plugin() {
                 val fileType = np.getString("fileType")
                 val sizeBytes = np.getLong("sizeBytes", -1L)
                 val path = np.getString("path")
+                val downloadJobId = np.getStringOrNull("downloadJobId")
+                val downloadFilename = np.getStringOrNull("downloadFilename")
                 onMain {
                     val bubble = JarvisChatMessage(
                         fromUser = false,
@@ -344,6 +354,8 @@ class JarvisPlugin : Plugin() {
                         presentFileType = fileType,
                         presentFileSizeBytes = sizeBytes,
                         presentFilePath = path,
+                        presentFileDownloadJobId = downloadJobId,
+                        presentFileDownloadFilename = downloadFilename,
                     )
                     val insertAt = liveAssistantIndex()
                     if (insertAt >= 0) {
@@ -351,6 +363,32 @@ class JarvisPlugin : Plugin() {
                     } else {
                         askMessages.add(bubble)
                     }
+                }
+                return true
+            }
+            "downloadFile" -> {
+                // The actual bytes for a presentFile card's Download button —
+                // the first Jarvis packet type that carries a real payload
+                // instead of just JSON fields (see jarvisplugin.cpp's
+                // handleDownloadFile). Streamed straight into
+                // MediaStore.Downloads rather than buffered in memory, since
+                // this can be up to present_tools.py's 300MB cap.
+                val filename = np.getString("filename").ifBlank { "download" }
+                val payload = np.payload
+                if (payload?.inputStream == null) {
+                    onMain { lastError.value = "Download failed: no data received." }
+                    return true
+                }
+                val ok = try {
+                    saveDownloadToDownloads(context, filename, payload.inputStream!!)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed saving downloaded file", e)
+                    false
+                } finally {
+                    payload.close()
+                }
+                onMain {
+                    lastError.value = if (ok) "" else "Download failed: could not save $filename."
                 }
                 return true
             }
@@ -662,6 +700,19 @@ class JarvisPlugin : Plugin() {
         }
     }
 
+    // Download button on a PresentFileBubble — jobId/filename are exactly
+    // what the desktop sent on the presentFile packet's downloadJobId/
+    // downloadFilename, round-tripped back so handleDownloadFile can
+    // re-validate them (see jarvisplugin.cpp). The bytes come back
+    // separately as a "downloadFile" packet with a payload, not as a
+    // reply to this call.
+    fun downloadFile(jobId: String, filename: String) {
+        sendAction("downloadFile") {
+            it["jobId"] = jobId
+            it["filename"] = filename
+        }
+    }
+
     fun aiClear() {
         sendAction("aiClear")
     }
@@ -850,6 +901,73 @@ private fun splitConsoleDump(lines: List<String>): JarvisConsoleSplit {
     return JarvisConsoleSplit(name, dump, reply)
 }
 
+// Streams a "downloadFile" packet's payload straight into
+// MediaStore.Downloads, without ever buffering the whole thing in memory —
+// unlike saveScreenshotToDownloads (JarvisScreens.kt), which takes a small
+// ByteArray, this can be up to present_tools.py's 300MB cap. Uses
+// java.net.URLConnection.guessContentTypeFromName as a cheap best-effort
+// MIME guess since a present_file download can be any file type, not just
+// PNG screenshots.
+//
+// IMPORTANT: MediaStore.Downloads rows inserted with IS_PENDING=1 show up
+// to the user as a stuck ".pending-<n>-<filename>" placeholder until
+// IS_PENDING is explicitly cleared back to 0 — if the copy throws partway
+// through (socket hiccup, disk full, whatever) we MUST delete that row
+// rather than let it linger looking like a permanently-failed download.
+private fun saveDownloadToDownloads(context: Context, filename: String, input: InputStream): Boolean {
+    val name = filename.ifBlank { "jarvis_download" }
+    val mimeType = java.net.URLConnection.guessContentTypeFromName(name) ?: "application/octet-stream"
+    return try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val values = ContentValues().apply {
+                put(MediaStore.Downloads.DISPLAY_NAME, name)
+                put(MediaStore.Downloads.MIME_TYPE, mimeType)
+                put(MediaStore.Downloads.IS_PENDING, 1)
+            }
+            val uri = context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                ?: return false
+            try {
+                val out = context.contentResolver.openOutputStream(uri)
+                    ?: throw java.io.IOException("openOutputStream returned null for $uri")
+                out.use { input.copyTo(it) }
+                values.clear()
+                values.put(MediaStore.Downloads.IS_PENDING, 0)
+                context.contentResolver.update(uri, values, null, null)
+                true
+            } catch (e: Exception) {
+                // Don't leave a permanently-pending placeholder behind —
+                // remove the half-written row so the failure is at least
+                // clean (no bytes to fetch was clearer than one that looks
+                // like it downloaded but never finishes).
+                Log.e(TAG, "Download write failed for $name, removing pending entry", e)
+                try {
+                    context.contentResolver.delete(uri, null, null)
+                } catch (_: Exception) {
+                }
+                false
+            }
+        } else {
+            val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            if (!dir.exists() && !dir.mkdirs()) {
+                return false
+            }
+            val file = File(dir, name)
+            try {
+                file.outputStream().use { out -> input.copyTo(out) }
+                MediaStoreHelper.indexFile(context, android.net.Uri.fromFile(file))
+                true
+            } catch (e: Exception) {
+                Log.e(TAG, "Download write failed for $name", e)
+                file.delete()
+                false
+            }
+        }
+    } catch (e: Exception) {
+        Log.e(TAG, "Download failed for $name", e)
+        false
+    }
+}
+
 data class JarvisChatMessage(
     val fromUser: Boolean,
     val text: String,
@@ -888,13 +1006,21 @@ data class JarvisChatMessage(
     // "Shared from your PC" card for the present_file AI tool — a single
     // file/folder the AI explicitly chose to show, mid-reply. See
     // JarvisPlugin's "presentFile" packet case and JarvisScreens.kt's
-    // PresentFileBubble. No Download here (see wire-format note in
-    // JarvisPlugin) — only Reveal/Open via plugin.fileAction.
+    // PresentFileBubble. Reveal/Open go through plugin.fileAction; Download
+    // (when the desktop actually prepared a copy — see downloadJobId/
+    // Filename below) goes through plugin.downloadFile instead, since it
+    // needs KDE Connect's payload transfer, not the fileAction JSON round-trip.
     val isPresentFile: Boolean = false,
     val presentFileName: String? = null,
     val presentFileType: String? = null,   // "file" | "folder"
     val presentFileSizeBytes: Long? = null, // null or -1 both mean "unknown"
     val presentFilePath: String? = null,
+    // Non-null only when present_tools.py actually prepared a download copy
+    // on the desktop (skipped past DOWNLOAD_SIZE_CAP, or on copy failure) —
+    // PresentFileBubble should only show/enable its Download button when
+    // both are set.
+    val presentFileDownloadJobId: String? = null,
+    val presentFileDownloadFilename: String? = null,
 )
 
 data class JarvisSequenceItem(
