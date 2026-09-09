@@ -1163,8 +1163,7 @@ private fun PresentFileBubble(msg: JarvisChatMessage, onAction: (path: String, k
     // The present_file AI tool explicitly showing one specific file/folder
     // already on the desktop PC — see JarvisPlugin's "presentFile" packet
     // case. Visual reference is AskFileActionsBubble, but this card only
-    // ever describes one file, not a list — and there's no Download button
-    // here (no backing endpoint from this plugin, see wire-format note).
+    // ever describes one file, not a list.
     val isFolder = msg.presentFileType == "folder"
     val sizeBytes = msg.presentFileSizeBytes
     Row(
@@ -1172,13 +1171,13 @@ private fun PresentFileBubble(msg: JarvisChatMessage, onAction: (path: String, k
         horizontalArrangement = Arrangement.Start,
     ) {
         Card(
-            modifier = Modifier.widthIn(max = 320.dp),
+            modifier = Modifier.widthIn(max = 220.dp),
             shape = RoundedCornerShape(16.dp),
             colors = androidx.compose.material3.CardDefaults.cardColors(
-                containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                containerColor = MaterialTheme.colorScheme.primaryContainer,
             ),
         ) {
-            Column(Modifier.padding(12.dp)) {
+            Column(Modifier.padding(8.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
                         if (isFolder) "\uD83D\uDCC1" else "\uD83D\uDCC4",
@@ -1189,15 +1188,15 @@ private fun PresentFileBubble(msg: JarvisChatMessage, onAction: (path: String, k
                         stringResource(R.string.jarvis_present_file_title),
                         style = MaterialTheme.typography.labelMedium,
                         fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer,
                     )
                 }
                 Text(
                     msg.presentFileName ?: "",
                     style = MaterialTheme.typography.bodyLarge,
                     fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onSecondaryContainer,
-                    modifier = Modifier.padding(top = 8.dp),
+                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                    modifier = Modifier.padding(top = 6.dp),
                 )
                 val typeLabel = stringResource(
                     if (isFolder) R.string.jarvis_present_file_folder else R.string.jarvis_present_file_file,
@@ -1210,25 +1209,22 @@ private fun PresentFileBubble(msg: JarvisChatMessage, onAction: (path: String, k
                 Text(
                     "$typeLabel \u2013 $sizeLabel",
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer,
                 )
                 Text(
                     msg.presentFilePath ?: "",
                     fontFamily = FontFamily.Monospace,
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer,
                     modifier = Modifier.padding(top = 4.dp),
                 )
                 Row(
-                    Modifier.padding(top = 8.dp).fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    Modifier.padding(top = 6.dp).fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
                     val path = msg.presentFilePath.orEmpty()
-                    OutlinedButton(onClick = { onAction(path, "reveal") }) {
-                        Text(stringResource(R.string.jarvis_file_reveal))
-                    }
-                    OutlinedButton(onClick = { onAction(path, "openLocation") }) {
-                        Text(stringResource(R.string.jarvis_file_open_location))
+                    OutlinedButton(onClick = { onAction(path, "download") }) {
+                        Text(stringResource(R.string.jarvis_download))
                     }
                     if (!isFolder) {
                         OutlinedButton(onClick = { onAction(path, "openFile") }) {
