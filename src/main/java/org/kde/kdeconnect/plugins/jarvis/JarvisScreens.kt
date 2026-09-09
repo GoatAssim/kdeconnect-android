@@ -696,6 +696,10 @@ private fun AskScreen(plugin: JarvisPlugin, back: () -> Unit) {
                         AskFileActionsBubble(msg, onAction = { path, kind -> plugin.fileAction(path, kind) })
                         return@items
                     }
+                    if (msg.isOrganizeJson) {
+                        OrganizeJsonBubble(msg)
+                        return@items
+                    }
                     if (msg.isConsole) {
                         AskConsoleBubble(msg)
                         return@items
@@ -1162,7 +1166,7 @@ private fun jsonScalarLabel(v: Any?): String = when (v) {
 private fun jsonIsContainer(v: Any?): Boolean = v is JSONObject || v is JSONArray
 
 @Composable
-private fun JsonTreeEditor(root: Any, onChange: () -> Unit) {
+private fun JsonTreeEditor(root: Any, editable: Boolean = true, onChange: () -> Unit = {}) {
     var version by remember { mutableIntStateOf(0) }
     val expanded = remember { mutableStateMapOf<String, Boolean>() }
     fun bump() { version++; onChange() }
@@ -1184,7 +1188,7 @@ private fun JsonTreeEditor(root: Any, onChange: () -> Unit) {
             if (key != null) {
                 if (isArrayItem) {
                     Text("[$key]", Modifier.padding(end = 4.dp), style = MaterialTheme.typography.bodySmall)
-                } else if (keyEdit) {
+                } else if (editable && keyEdit) {
                     var kv by remember(path) { mutableStateOf(key) }
                     OutlinedTextField(
                         value = kv, onValueChange = { kv = it },
@@ -1196,7 +1200,12 @@ private fun JsonTreeEditor(root: Any, onChange: () -> Unit) {
                         keyEdit = false
                     }) { Icon(Icons.Filled.Close, null) }
                 } else {
-                    Text(key, Modifier.clickable { keyEdit = true }.padding(end = 4.dp), style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
+                    Text(
+                        key,
+                        Modifier.let { if (editable) it.clickable { keyEdit = true } else it }.padding(end = 4.dp),
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Bold,
+                    )
                 }
                 Text(":", Modifier.padding(end = 4.dp))
             }
@@ -1205,7 +1214,7 @@ private fun JsonTreeEditor(root: Any, onChange: () -> Unit) {
                 Text(label, style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
             } else {
                 var editing by remember(path, version) { mutableStateOf(false) }
-                if (editing) {
+                if (editable && editing) {
                     var tv by remember(path) { mutableStateOf(if (value is String) value else jsonScalarLabel(value)) }
                     OutlinedTextField(
                         value = tv, onValueChange = { tv = it },
@@ -1220,12 +1229,12 @@ private fun JsonTreeEditor(root: Any, onChange: () -> Unit) {
                 } else {
                     Text(
                         jsonScalarLabel(value),
-                        Modifier.weight(1f).clickable { editing = true },
+                        Modifier.weight(1f).let { if (editable) it.clickable { editing = true } else it },
                         style = MaterialTheme.typography.bodyMedium,
                     )
                 }
             }
-            if (onDelete != null) {
+            if (editable && onDelete != null) {
                 IconButton(onClick = { onDelete(); bump() }, modifier = Modifier.width(32.dp)) {
                     Icon(Icons.Filled.Delete, null, modifier = Modifier.width(16.dp))
                 }
@@ -1245,13 +1254,15 @@ private fun JsonTreeEditor(root: Any, onChange: () -> Unit) {
                 Row(childPath, depth, k, child, false, onDelete = { value.remove(k) })
                 if (jsonIsContainer(child)) renderContainer(childPath, child!!, depth + 1)
             }
-            TextButton(onClick = {
-                var name = "new_key"; var n = 1
-                while (value.has(name)) { name = "new_key_$n"; n++ }
-                value.put(name, "")
-                expanded[path] = true
-                bump()
-            }, Modifier.padding(start = ((depth + 1) * 14).dp)) { Text("+ add key") }
+            if (editable) {
+                TextButton(onClick = {
+                    var name = "new_key"; var n = 1
+                    while (value.has(name)) { name = "new_key_$n"; n++ }
+                    value.put(name, "")
+                    expanded[path] = true
+                    bump()
+                }, Modifier.padding(start = ((depth + 1) * 14).dp)) { Text("+ add key") }
+            }
         } else if (value is JSONArray) {
             for (i in 0 until value.length()) {
                 val childPath = "$path.$i"
@@ -1259,11 +1270,13 @@ private fun JsonTreeEditor(root: Any, onChange: () -> Unit) {
                 Row(childPath, depth, i.toString(), child, true, onDelete = { value.remove(i) })
                 if (jsonIsContainer(child)) renderContainer(childPath, child!!, depth + 1)
             }
-            TextButton(onClick = {
-                value.put("")
-                expanded[path] = true
-                bump()
-            }, Modifier.padding(start = ((depth + 1) * 14).dp)) { Text("+ add item") }
+            if (editable) {
+                TextButton(onClick = {
+                    value.put("")
+                    expanded[path] = true
+                    bump()
+                }, Modifier.padding(start = ((depth + 1) * 14).dp)) { Text("+ add item") }
+            }
         }
     }
 
@@ -1271,6 +1284,99 @@ private fun JsonTreeEditor(root: Any, onChange: () -> Unit) {
         key(version) {
             if (jsonIsContainer(root)) renderContainer("$", root, 0)
             else Text(jsonScalarLabel(root))
+        }
+    }
+}
+
+// View-only Organized(Fancy)/Raw JSON bubble for the organize_json AI
+// tool's result (see JarvisPlugin's "organizeJson" packet case) — mirrors
+// the web UI's renderOrganizeJsonResult: same JsonTreeEditor as
+// ConfigScreen's editor, just with editable=false, since this is a
+// snapshot of a file already on disk, not something submitted back with
+// Save. Bubble styling mirrors AskFileActionsBubble above.
+@Composable
+private fun OrganizeJsonBubble(msg: JarvisChatMessage) {
+    val text = msg.organizeJsonText.orEmpty()
+    val parsed = remember(text) {
+        if (text.isBlank()) {
+            null
+        } else {
+            try {
+                val t = text.trim()
+                if (t.startsWith("[")) JSONArray(t) else JSONObject(t)
+            } catch (_: Exception) {
+                null
+            }
+        }
+    }
+    var useFancy by remember(msg.organizeJsonPath) { mutableStateOf(true) }
+
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        horizontalArrangement = Arrangement.Start,
+    ) {
+        Card(
+            modifier = Modifier.widthIn(max = 320.dp),
+            shape = RoundedCornerShape(16.dp),
+            colors = androidx.compose.material3.CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.secondaryContainer,
+            ),
+        ) {
+            Column(Modifier.padding(12.dp)) {
+                Text(
+                    stringResource(R.string.jarvis_organize_json_title),
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                )
+                if (!msg.organizeJsonPath.isNullOrEmpty()) {
+                    Text(
+                        msg.organizeJsonPath,
+                        Modifier.padding(top = 4.dp),
+                        fontFamily = FontFamily.Monospace,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    )
+                }
+                if (!msg.organizeJsonError.isNullOrEmpty()) {
+                    Text(
+                        msg.organizeJsonError,
+                        Modifier.padding(top = 8.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                    return@Column
+                }
+                if (parsed == null) {
+                    Text(
+                        stringResource(R.string.jarvis_organize_json_invalid),
+                        Modifier.padding(top = 8.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                    return@Column
+                }
+                Row(Modifier.padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    TextButton(onClick = { useFancy = true }) {
+                        Text(if (useFancy) "● " + stringResource(R.string.jarvis_organize_json_fancy) else stringResource(R.string.jarvis_organize_json_fancy))
+                    }
+                    TextButton(onClick = { useFancy = false }) {
+                        Text(if (!useFancy) stringResource(R.string.jarvis_raw_json) + " ●" else stringResource(R.string.jarvis_raw_json))
+                    }
+                }
+                Box(Modifier.padding(top = 4.dp).heightIn(max = 320.dp).verticalScroll(rememberScrollState())) {
+                    if (useFancy) {
+                        JsonTreeEditor(parsed, editable = false)
+                    } else {
+                        Text(
+                            text,
+                            fontFamily = FontFamily.Monospace,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer,
+                        )
+                    }
+                }
+            }
         }
     }
 }

@@ -311,6 +311,35 @@ class JarvisPlugin : Plugin() {
                 }
                 return true
             }
+            "organizeJson" -> {
+                // The organize_json AI tool never sends file contents to the
+                // model — only a resolved path (see jarvis-cli's
+                // json_tools.py). The desktop plugin re-fetches the parsed
+                // text via /api/json/organize and forwards it here as its
+                // own bubble, view-only, with the same Fancy/Raw toggle as
+                // the config screen — mirrors the web UI's
+                // renderOrganizeJsonResult.
+                val path = np.getString("path")
+                val text = np.getString("text")
+                val err = np.getString("error")
+                onMain {
+                    val bubble = JarvisChatMessage(
+                        fromUser = false,
+                        text = "",
+                        isOrganizeJson = true,
+                        organizeJsonPath = path,
+                        organizeJsonText = text,
+                        organizeJsonError = err.ifEmpty { null },
+                    )
+                    val insertAt = liveAssistantIndex()
+                    if (insertAt >= 0) {
+                        askMessages.add(insertAt, bubble)
+                    } else {
+                        askMessages.add(bubble)
+                    }
+                }
+                return true
+            }
             "askFileActions" -> {
                 // Paths the desktop plugin spotted (and verified exist) in
                 // the reply that just finished streaming — see
@@ -759,6 +788,15 @@ data class JarvisChatMessage(
     // jarvisplugin.cpp's collectFileActionCandidates/sendCollectedFileActions.
     val isFileActions: Boolean = false,
     val fileActionsJson: String? = null,
+    // View-only Organized(Fancy)/Raw JSON bubble for the organize_json AI
+    // tool's result — see JarvisPlugin's "organizeJson" packet case and
+    // JarvisScreens.kt's OrganizeJsonBubble. Unlike ConfigScreen's editor,
+    // this is never editable: it's a display of a file already on disk,
+    // shown so the user doesn't have to open it themselves.
+    val isOrganizeJson: Boolean = false,
+    val organizeJsonPath: String? = null,
+    val organizeJsonText: String? = null,
+    val organizeJsonError: String? = null,
 )
 
 data class JarvisSequenceItem(

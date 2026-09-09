@@ -92,6 +92,9 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
     <string name="jarvis_confirm_approved">✓ Approved — running…</string>
     <string name="jarvis_confirm_declined">✗ Declined</string>
     <string name="jarvis_file_actions_title">Found on your PC</string>
+    <string name="jarvis_organize_json_title">Organized JSON</string>
+    <string name="jarvis_organize_json_fancy">Fancy</string>
+    <string name="jarvis_organize_json_invalid">Couldn\'t parse the returned JSON.</string>
     <string name="jarvis_file_reveal">Reveal in Explorer</string>
     <string name="jarvis_file_open_location">Open location</string>
     <string name="jarvis_file_open">Open file</string>
