@@ -901,6 +901,8 @@ private fun splitConsoleDump(lines: List<String>): JarvisConsoleSplit {
     return JarvisConsoleSplit(name, dump, reply)
 }
 
+private const val DOWNLOAD_TAG = "JarvisPlugin"
+
 // Streams a "downloadFile" packet's payload straight into
 // MediaStore.Downloads, without ever buffering the whole thing in memory —
 // unlike saveScreenshotToDownloads (JarvisScreens.kt), which takes a small
@@ -939,7 +941,7 @@ private fun saveDownloadToDownloads(context: Context, filename: String, input: I
                 // remove the half-written row so the failure is at least
                 // clean (no bytes to fetch was clearer than one that looks
                 // like it downloaded but never finishes).
-                Log.e(TAG, "Download write failed for $name, removing pending entry", e)
+                Log.e(DOWNLOAD_TAG, "Download write failed for $name, removing pending entry", e)
                 try {
                     context.contentResolver.delete(uri, null, null)
                 } catch (_: Exception) {
@@ -957,13 +959,13 @@ private fun saveDownloadToDownloads(context: Context, filename: String, input: I
                 MediaStoreHelper.indexFile(context, android.net.Uri.fromFile(file))
                 true
             } catch (e: Exception) {
-                Log.e(TAG, "Download write failed for $name", e)
+                Log.e(DOWNLOAD_TAG, "Download write failed for $name", e)
                 file.delete()
                 false
             }
         }
     } catch (e: Exception) {
-        Log.e(TAG, "Download failed for $name", e)
+        Log.e(DOWNLOAD_TAG, "Download failed for $name", e)
         false
     }
 }
