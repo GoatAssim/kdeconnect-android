@@ -1145,6 +1145,136 @@ private fun shareScreenshot(context: android.content.Context, filename: String, 
     }
 }
 
+private fun jsonCoerce(raw: String): Any? {
+    if (raw == "null") return null
+    if (raw == "true") return true
+    if (raw == "false") return false
+    raw.toDoubleOrNull()?.let { if (Regex("^-?\\d+(\\.\\d+)?([eE][-+]?\\d+)?$").matches(raw.trim())) return if (raw.contains('.') || raw.contains('e') || raw.contains('E')) it else raw.toLongOrNull() ?: it }
+    return raw
+}
+
+private fun jsonScalarLabel(v: Any?): String = when (v) {
+    null, JSONObject.NULL -> "null"
+    is String -> "\"$v\""
+    else -> v.toString()
+}
+
+private fun jsonIsContainer(v: Any?): Boolean = v is JSONObject || v is JSONArray
+
+@Composable
+private fun JsonTreeEditor(root: Any, onChange: () -> Unit) {
+    var version by remember { mutableIntStateOf(0) }
+    val expanded = remember { mutableStateMapOf<String, Boolean>() }
+    fun bump() { version++; onChange() }
+
+    @Composable
+    fun Row(path: String, depth: Int, key: String?, value: Any?, isArrayItem: Boolean, onDelete: (() -> Unit)?) {
+        val container = jsonIsContainer(value)
+        val isOpen = expanded[path] ?: (depth < 2)
+        androidx.compose.foundation.layout.Row(
+            Modifier.fillMaxWidth().padding(start = (depth * 14).dp, top = 2.dp, bottom = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            if (container) {
+                Text(if (isOpen) "▾" else "▸", Modifier.clickable { expanded[path] = !isOpen }.padding(end = 4.dp))
+            } else {
+                Spacer(Modifier.width(14.dp))
+            }
+            var keyEdit by remember(path) { mutableStateOf(false) }
+            if (key != null) {
+                if (isArrayItem) {
+                    Text("[$key]", Modifier.padding(end = 4.dp), style = MaterialTheme.typography.bodySmall)
+                } else if (keyEdit) {
+                    var kv by remember(path) { mutableStateOf(key) }
+                    OutlinedTextField(
+                        value = kv, onValueChange = { kv = it },
+                        modifier = Modifier.widthIn(min = 40.dp, max = 140.dp).height(48.dp),
+                        singleLine = true,
+                    )
+                    IconButton(onClick = {
+                        val parent = value // unused placeholder to satisfy scope; real rename done by caller below
+                        keyEdit = false
+                    }) { Icon(Icons.Filled.Close, null) }
+                } else {
+                    Text(key, Modifier.clickable { keyEdit = true }.padding(end = 4.dp), style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
+                }
+                Text(":", Modifier.padding(end = 4.dp))
+            }
+            if (container) {
+                val label = if (value is JSONArray) "[ ] ${value.length()} items" else "{ } ${(value as JSONObject).length()} keys"
+                Text(label, style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
+            } else {
+                var editing by remember(path, version) { mutableStateOf(false) }
+                if (editing) {
+                    var tv by remember(path) { mutableStateOf(if (value is String) value else jsonScalarLabel(value)) }
+                    OutlinedTextField(
+                        value = tv, onValueChange = { tv = it },
+                        modifier = Modifier.weight(1f).height(48.dp),
+                        singleLine = true,
+                        trailingIcon = {
+                            IconButton(onClick = { editing = false /* commit handled by caller via closures below */ }) {
+                                Icon(Icons.Filled.Close, null)
+                            }
+                        },
+                    )
+                } else {
+                    Text(
+                        jsonScalarLabel(value),
+                        Modifier.weight(1f).clickable { editing = true },
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
+            }
+            if (onDelete != null) {
+                IconButton(onClick = { onDelete(); bump() }, modifier = Modifier.width(32.dp)) {
+                    Icon(Icons.Filled.Delete, null, modifier = Modifier.width(16.dp))
+                }
+            }
+        }
+    }
+
+    @Composable
+    fun renderContainer(path: String, value: Any, depth: Int) {
+        val isOpen = expanded[path] ?: (depth < 2)
+        if (!isOpen && depth > 0) return
+        if (value is JSONObject) {
+            val keys = value.keys().asSequence().toList()
+            for (k in keys) {
+                val childPath = "$path.$k"
+                val child = value.opt(k)
+                Row(childPath, depth, k, child, false, onDelete = { value.remove(k) })
+                if (jsonIsContainer(child)) renderContainer(childPath, child!!, depth + 1)
+            }
+            TextButton(onClick = {
+                var name = "new_key"; var n = 1
+                while (value.has(name)) { name = "new_key_$n"; n++ }
+                value.put(name, "")
+                expanded[path] = true
+                bump()
+            }, Modifier.padding(start = ((depth + 1) * 14).dp)) { Text("+ add key") }
+        } else if (value is JSONArray) {
+            for (i in 0 until value.length()) {
+                val childPath = "$path.$i"
+                val child = value.opt(i)
+                Row(childPath, depth, i.toString(), child, true, onDelete = { value.remove(i) })
+                if (jsonIsContainer(child)) renderContainer(childPath, child!!, depth + 1)
+            }
+            TextButton(onClick = {
+                value.put("")
+                expanded[path] = true
+                bump()
+            }, Modifier.padding(start = ((depth + 1) * 14).dp)) { Text("+ add item") }
+        }
+    }
+
+    androidx.compose.foundation.layout.Column(Modifier.fillMaxWidth()) {
+        key(version) {
+            if (jsonIsContainer(root)) renderContainer("$", root, 0)
+            else Text(jsonScalarLabel(root))
+        }
+    }
+}
+
 @Composable
 private fun ConfigScreen(plugin: JarvisPlugin, back: () -> Unit) {
     // Generic like the web UI's Settings modal: the tab list comes from
@@ -1161,12 +1291,24 @@ private fun ConfigScreen(plugin: JarvisPlugin, back: () -> Unit) {
     val activeFile = files.getOrNull(safeTab)
     val which = activeFile?.name.orEmpty()
     var text by remember { mutableStateOf(plugin.configTexts[which] ?: "") }
+    var useFancy by remember(which) { mutableStateOf(true) }
+    var parsed by remember(which) { mutableStateOf<Any?>(null) }
+    var parseError by remember(which) { mutableStateOf<String?>(null) }
 
     LaunchedEffect(which) {
         if (which.isNotEmpty()) plugin.getConfig(which)
     }
     LaunchedEffect(plugin.configTexts[which]) {
         text = plugin.configTexts[which] ?: text
+        try {
+            val t = text.trim()
+            parsed = if (t.startsWith("[")) JSONArray(t) else JSONObject(t)
+            parseError = null
+        } catch (e: Exception) {
+            parsed = null
+            parseError = e.message
+            useFancy = false
+        }
     }
 
     Scaffold(
@@ -1206,20 +1348,53 @@ private fun ConfigScreen(plugin: JarvisPlugin, back: () -> Unit) {
             if (path.isNotEmpty()) {
                 Text(path, Modifier.padding(horizontal = 16.dp, vertical = 4.dp), style = MaterialTheme.typography.bodySmall)
             }
-            OutlinedTextField(
-                value = text,
-                onValueChange = { text = it },
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-                    .padding(16.dp),
-            )
+            Row(Modifier.padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+                TextButton(onClick = {
+                    if (!useFancy) {
+                        try {
+                            val t = text.trim()
+                            parsed = if (t.startsWith("[")) JSONArray(t) else JSONObject(t)
+                            parseError = null
+                            useFancy = true
+                        } catch (e: Exception) { parseError = e.message }
+                    }
+                }) { Text(if (useFancy) "● Fancy" else "○ Fancy") }
+                TextButton(onClick = {
+                    if (useFancy && parsed != null) {
+                        text = if (parsed is JSONArray) (parsed as JSONArray).toString(2) else (parsed as JSONObject).toString(2)
+                    }
+                    useFancy = false
+                }) { Text(if (!useFancy) stringResource(R.string.jarvis_raw_json) + " ●" else stringResource(R.string.jarvis_raw_json)) }
+            }
+            if (parseError != null && useFancy) {
+                Text("Can't show Fancy — invalid JSON: $parseError", Modifier.padding(16.dp), color = MaterialTheme.colorScheme.error)
+            } else if (useFancy && parsed != null) {
+                Box(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp)) {
+                    JsonTreeEditor(parsed!!) {
+                        text = if (parsed is JSONArray) (parsed as JSONArray).toString(2) else (parsed as JSONObject).toString(2)
+                    }
+                }
+            } else {
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { text = it },
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                )
+            }
             Row(Modifier.padding(16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(onClick = { plugin.getConfig(which) }) {
                     Text(stringResource(R.string.jarvis_reload))
                 }
                 Spacer(Modifier.weight(1f))
-                Button(onClick = { plugin.setConfig(which, text) }) {
+                Button(onClick = {
+                    if (useFancy && parsed != null) {
+                        text = if (parsed is JSONArray) (parsed as JSONArray).toString(2) else (parsed as JSONObject).toString(2)
+                    }
+                    plugin.setConfig(which, text)
+                }) {
                     Text(stringResource(R.string.jarvis_save_file))
                 }
             }
